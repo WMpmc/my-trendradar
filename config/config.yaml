@@ -225,12 +225,12 @@ display:
   # 区域显示顺序（从上到下 = 推送中从上到下）
   # 调整顺序：剪切粘贴整行即可
   # 要显示某个区域，需同时：1. 在此列表中  2. 下方 regions 对应开关为 true
-   region_order:
-    - ai_analysis                         # AI分析放最前面
-    - new_items                           # 新增热点
-    - hotlist                             # 分类新闻
-    - rss                                 # RSS行业资讯
-    - standalone                          # 总榜（完整热榜）
+     region_order:
+    - ai_analysis
+    - new_items
+    - hotlist
+    - rss
+    - standalone
 
   regions:
     hotlist: true
@@ -238,7 +238,8 @@ display:
     rss: true
     standalone: true
     ai_analysis: true
-
+    daily: false
+    weekly: false
   standalone:
     platforms: ["baidu", "weibo", "zhihu", "toutiao", "wallstreetcn-hot", "cls-hot", "thepaper", "ifeng"]
     rss_feeds: []
