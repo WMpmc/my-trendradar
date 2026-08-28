@@ -76,12 +76,10 @@ jobs:
             echo "Error: Config missing"
             exit 1
           fi
-
-      - name: Clean old report
-        if: success()
-        run: |
-          rm -f index.html
-          echo "Cleaned old index.html"
+          if [ ! -f dashboard.py ]; then
+            echo "Error: dashboard.py missing - please upload it"
+            exit 1
+          fi
 
       - name: Run crawler
         if: success()
@@ -92,22 +90,12 @@ jobs:
           GITHUB_ACTIONS: true
         run: uv run python -m trendradar
 
-      - name: Verify new report
+      - name: Generate visual dashboard
         if: success()
         run: |
-          if [ ! -f index.html ]; then
-            echo "ERROR: crawler did not generate index.html!"
-            ls -la
-            exit 1
-          fi
-          echo "Report generated successfully!"
-          grep -o '生成时间[^<]*' index.html | head -1
-
-      - name: Prepare Pages
-        if: success()
-        run: |
-          mkdir -p _site
-          cp index.html _site/index.html
+          python dashboard.py
+          echo "Dashboard generated!"
+          ls -la _site/
 
       - name: Setup Pages
         if: success()
@@ -134,10 +122,10 @@ jobs:
           SITE_URL="https://${OWNER}.github.io/${REPO}/"
           REPORT_TIME=$(TZ='Asia/Shanghai' date '+%H:%M')
           curl -s -X POST "https://ntfy.sh/$NTFY_TOPIC" \
-            -H "Title: 热点已更新" \
+            -H "Title: 热点情报已更新" \
             -H "Click: $SITE_URL" \
             -H "Tags: newspaper" \
             -H "Priority: default" \
             -H "Markdown: yes" \
-            -d "最新热点已抓取完成（$REPORT_TIME），[点击查看完整报告]($SITE_URL)"
+            -d "最新热点情报已生成（$REPORT_TIME），[点击查看仪表盘]($SITE_URL)"
           echo "Notification sent!"
