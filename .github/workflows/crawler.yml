@@ -119,7 +119,9 @@ jobs:
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
         run: |
-          SITE_URL="https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/"
+          OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          REPO=$(echo "${{ github.event.repository.name }}" | tr '[:upper:]' '[:lower:]')
+          SITE_URL="https://${OWNER}.github.io/${REPO}/"
           REPORT_TIME=$(TZ='Asia/Shanghai' date '+%H:%M')
           curl -s -X POST "https://ntfy.sh/$NTFY_TOPIC" \
             -H "Title: 热点已更新" \
