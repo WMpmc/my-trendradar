@@ -80,9 +80,6 @@ jobs:
       - name: Run crawler
         if: success()
         env:
-          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
-          NTFY_SERVER_URL: ${{ secrets.NTFY_SERVER_URL }}
-          NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
           AI_API_KEY: ${{ secrets.AI_API_KEY }}
           AI_MODEL: ${{ secrets.AI_MODEL }}
           AI_API_BASE: ${{ secrets.AI_API_BASE }}
@@ -116,3 +113,19 @@ jobs:
         if: success()
         id: deployment
         uses: actions/deploy-pages@v4
+
+      - name: Send ntfy notification
+        if: success()
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: |
+          SITE_URL="https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/"
+          REPORT_TIME=$(TZ='Asia/Shanghai' date '+%H:%M')
+          curl -s -X POST "https://ntfy.sh/$NTFY_TOPIC" \
+            -H "Title: 热点已更新" \
+            -H "Click: $SITE_URL" \
+            -H "Tags: newspaper" \
+            -H "Priority: default" \
+            -H "Markdown: yes" \
+            -d "最新热点已抓取完成（$REPORT_TIME），AI分析已生成，[点击查看完整报告]($SITE_URL)"
+          echo "Notification sent!"
