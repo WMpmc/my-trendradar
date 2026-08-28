@@ -162,7 +162,7 @@ report:
                                       # keyword = 按关键词分组显示
                                       # platform = 按平台/来源分组显示
 
-  sort_by_position_first: false       # 关键词模式排序（仅 display_mode=keyword 时生效）
+  sort_by_position_first: true       # 关键词模式排序（仅 display_mode=keyword 时生效）
                                       # true = 按 frequency_words.txt 的定义顺序
                                       # false = 按匹配到的热点条数排序（多的在前）
 
@@ -225,29 +225,24 @@ display:
   # 区域显示顺序（从上到下 = 推送中从上到下）
   # 调整顺序：剪切粘贴整行即可
   # 要显示某个区域，需同时：1. 在此列表中  2. 下方 regions 对应开关为 true
-  region_order:
-    - new_items                           # 1️⃣ 新增热点区域
-    - hotlist                             # 2️⃣ 热榜区域（关键词匹配 / AI 智能筛选）
-    - rss                                 # 3️⃣ RSS 订阅区域
-    - standalone                          # 4️⃣ 独立展示区
-    - ai_analysis                         # 5️⃣ AI 分析区域
+   region_order:
+    - ai_analysis                         # AI分析放最前面
+    - new_items                           # 新增热点
+    - hotlist                             # 分类新闻
+    - rss                                 # RSS行业资讯
+    - standalone                          # 总榜（完整热榜）
 
-  # 推送区域开关（需配合上方 region_order 使用）
   regions:
-    hotlist: true                     # 热榜区域：关键词匹配 / AI 智能筛选（true=显示, false=隐藏）
-    new_items: false                  # 新增热点区域：含热榜新增 + RSS 新增（true=显示, false=隐藏）
-                                      # 注：热点词汇统计中的新增标记🆕不受此配置影响
+    hotlist: true
+    new_items: true
+    rss: true
+    standalone: true
+    ai_analysis: true
 
-    rss: true                         # RSS 订阅区域（true=显示并分析, false=隐藏并跳过分析）
-    standalone: false                 # 独立展示区：完整热榜/RSS，不受关键词过滤（true=显示, false=隐藏）
-    ai_analysis: true                 # AI 分析区域（true=显示, false=隐藏）
-
-  # 独立展示区：将指定平台/RSS 完整展示，不受关键词过滤
-  # 推送展示由 regions.standalone 控制，AI 分析由 ai_analysis.include_standalone 控制
   standalone:
-    platforms: ["zhihu", "wallstreetcn-hot"]     # 热榜平台 ID 列表（如 ["zhihu", "weibo"]）
-    rss_feeds: []                                # RSS 源 ID 列表（如 ["hacker-news"]）
-    max_items: 20                                # 每个源最多展示条数（0=不限制）
+    platforms: ["baidu", "weibo", "zhihu", "toutiao", "wallstreetcn-hot", "cls-hot", "thepaper", "ifeng"]
+    rss_feeds: []
+    max_items: 30
 
 
 # ===============================================================
