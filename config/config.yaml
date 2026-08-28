@@ -76,17 +76,99 @@ rss:
     max_age_days: 2
 
   feeds:
+    # --- 科技/财经综合 ---
     - id: "36kr"
       name: "36氪"
       url: "https://36kr.com/feed"
 
+    - id: "huxiu"
+      name: "虎嗅"
+      url: "https://www.huxiu.com/rss/0.xml"
+
+    - id: "ifanr"
+      name: "爱范儿"
+      url: "https://www.ifanr.com/feed"
+
+    # --- 科华数据（自家公司） ---
+    - id: "kehua-news"
+      name: "科华数据"
+      url: "https://news.google.com/rss/search?q=科华数据+OR+科华技术+OR+kehua&hl=zh-CN&gl=CN&ceid=CN:zh-Hans"
+
+    # --- 友商监控 ---
+    - id: "huawei-digital-power"
+      name: "华为数字能源"
+      url: "https://news.google.com/rss/search?q=华为数字能源+OR+华为数据中心+OR+华为UPS&hl=zh-CN&gl=CN&ceid=CN:zh-Hans"
+
+    - id: "vertiv"
+      name: "维谛技术"
+      url: "https://news.google.com/rss/search?q=维谛技术+OR+Vertiv&hl=zh-CN&gl=CN&ceid=CN:zh-Hans"
+
+    - id: "kstar"
+      name: "科士达"
+      url: "https://news.google.com/rss/search?q=科士达+OR+KSTAR&hl=zh-CN&gl=CN&ceid=CN:zh-Hans"
+
+    - id: "eaton"
+      name: "伊顿"
+      url: "https://news.google.com/rss/search?q=伊顿+Eaton+UPS+OR+伊顿电气&hl=zh-CN&gl=CN&ceid=CN:zh-Hans"
+
+    - id: "schneider-apc"
+      name: "施耐德APC"
+      url: "https://news.google.com/rss/search?q=施耐德电气+OR+APC+UPS+OR+施耐德数据中心&hl=zh-CN&gl=CN&ceid=CN:zh-Hans"
+
+    - id: "delta"
+      name: "台达"
+      url: "https://news.google.com/rss/search?q=台达电子+OR+台达UPS+OR+Delta+Electronics&hl=zh-CN&gl=CN&ceid=CN:zh-Hans"
+
+    # --- 股份制银行（广东重点客户） ---
+    - id: "cmb"
+      name: "招商银行"
+      url: "https://news.google.com/rss/search?q=招商银行+数据中心+OR+招商银行+IT+OR+招商银行+科技&hl=zh-CN&gl=CN&ceid=CN:zh-Hans"
+
+    - id: "cib"
+      name: "兴业银行"
+      url: "https://news.google.com/rss/search?q=兴业银行+数据中心+OR+兴业银行+科技+OR+兴业银行+IT&hl=zh-CN&gl=CN&ceid=CN:zh-Hans"
+
+    - id: "spdb"
+      name: "浦发银行"
+      url: "https://news.google.com/rss/search?q=浦发银行+数据中心+OR+浦发银行+科技&hl=zh-CN&gl=CN&ceid=CN:zh-Hans"
+
+    - id: "citic"
+      name: "中信银行"
+      url: "https://news.google.com/rss/search?q=中信银行+数据中心+OR+中信银行+科技&hl=zh-CN&gl=CN&ceid=CN:zh-Hans"
+
+    - id: "ceb"
+      name: "光大银行"
+      url: "https://news.google.com/rss/search?q=光大银行+数据中心+OR+光大银行+科技&hl=zh-CN&gl=CN&ceid=CN:zh-Hans"
+
+    - id: "pingan"
+      name: "平安银行"
+      url: "https://news.google.com/rss/search?q=平安银行+数据中心+OR+平安银行+科技&hl=zh-CN&gl=CN&ceid=CN:zh-Hans"
+
+    - id: "cgb"
+      name: "广发银行"
+      url: "https://news.google.com/rss/search?q=广发银行+数据中心+OR+广发银行+科技&hl=zh-CN&gl=CN&ceid=CN:zh-Hans"
+
+    - id: "cmbc"
+      name: "民生银行"
+      url: "https://news.google.com/rss/search?q=民生银行+数据中心+OR+民生银行+科技&hl=zh-CN&gl=CN&ceid=CN:zh-Hans"
+
+    - id: "hxb"
+      name: "华夏银行"
+      url: "https://news.google.com/rss/search?q=华夏银行+数据中心+OR+华夏银行+科技&hl=zh-CN&gl=CN&ceid=CN:zh-Hans"
+
+    # --- 行业资讯 ---
+    - id: "datacenter"
+      name: "数据中心行业"
+      url: "https://news.google.com/rss/search?q=数据中心+UPS+OR+数据中心+供电+OR+数据中心+机柜&hl=zh-CN&gl=CN&ceid=CN:zh-Hans"
+
+    - id: "guangdong-finance"
+      name: "广东金融科技"
+      url: "https://news.google.com/rss/search?q=广东+银行+数据中心+OR+广东+金融+科技+OR+大湾区+金融&hl=zh-CN&gl=CN&ceid=CN:zh-Hans"
+
+    # --- 国际 ---
     - id: "hacker-news"
       name: "Hacker News"
       url: "https://hnrss.org/frontpage"
-
-    - id: "yahoo-finance"
-      name: "雅虎财经"
-      url: "https://finance.yahoo.com/news/rssindex"
 
 
 # ===============================================================
