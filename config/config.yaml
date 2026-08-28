@@ -288,7 +288,7 @@ notification:
 
     ntfy:
       server_url: "https://ntfy.sh"   # ntfy 服务器地址（可改为自托管）
-      topic: ""                       # ntfy 主题名称
+      topic: "trendradar-svqmtpdo-5639"                       # ntfy 主题名称
       token: ""                       # ntfy 访问令牌（可选，用于私有主题）
 
     bark:
