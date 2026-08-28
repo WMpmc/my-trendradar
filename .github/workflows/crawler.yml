@@ -1,7 +1,7 @@
 name: Get Hot News
 
 on:
-   schedule:
+  schedule:
     - cron: "0 0,9 * * *"
   workflow_dispatch:
 
@@ -76,16 +76,6 @@ jobs:
             echo "Error: Config missing"
             exit 1
           fi
-          if [ ! -f config/frequency_words.txt ]; then
-            echo "Error: frequency_words.txt missing"
-            exit 1
-          fi
-          echo "=== frequency_words.txt first 10 lines ==="
-          head -10 config/frequency_words.txt
-          echo "=== config.yaml key settings ==="
-          grep -A2 'region_order' config/config.yaml | head -10
-          grep -A3 'standalone:' config/config.yaml | head -8
-          grep 'enabled:' config/config.yaml | head -5
 
       - name: Clean old report
         if: success()
@@ -107,15 +97,11 @@ jobs:
         run: |
           if [ ! -f index.html ]; then
             echo "ERROR: crawler did not generate index.html!"
-            echo "=== Files in root ==="
             ls -la
             exit 1
           fi
           echo "Report generated successfully!"
-          echo "=== Report date ==="
           grep -o '生成时间[^<]*' index.html | head -1
-          echo "=== File size ==="
-          wc -c index.html
 
       - name: Prepare Pages
         if: success()
