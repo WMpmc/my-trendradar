@@ -76,6 +76,22 @@ jobs:
             echo "Error: Config missing"
             exit 1
           fi
+          if [ ! -f config/frequency_words.txt ]; then
+            echo "Error: frequency_words.txt missing"
+            exit 1
+          fi
+          echo "=== frequency_words.txt first 10 lines ==="
+          head -10 config/frequency_words.txt
+          echo "=== config.yaml key settings ==="
+          grep -A2 'region_order' config/config.yaml | head -10
+          grep -A3 'standalone:' config/config.yaml | head -8
+          grep 'enabled:' config/config.yaml | head -5
+
+      - name: Clean old report
+        if: success()
+        run: |
+          rm -f index.html
+          echo "Cleaned old index.html"
 
       - name: Run crawler
         if: success()
@@ -86,18 +102,26 @@ jobs:
           GITHUB_ACTIONS: true
         run: uv run python -m trendradar
 
+      - name: Verify new report
+        if: success()
+        run: |
+          if [ ! -f index.html ]; then
+            echo "ERROR: crawler did not generate index.html!"
+            echo "=== Files in root ==="
+            ls -la
+            exit 1
+          fi
+          echo "Report generated successfully!"
+          echo "=== Report date ==="
+          grep -o '生成时间[^<]*' index.html | head -1
+          echo "=== File size ==="
+          wc -c index.html
+
       - name: Prepare Pages
         if: success()
         run: |
           mkdir -p _site
-          if [ -f index.html ]; then
-            cp index.html _site/index.html
-            echo "Copied index.html to _site/"
-          else
-            echo "ERROR: index.html not found!"
-            ls -la
-            exit 1
-          fi
+          cp index.html _site/index.html
 
       - name: Setup Pages
         if: success()
@@ -129,5 +153,5 @@ jobs:
             -H "Tags: newspaper" \
             -H "Priority: default" \
             -H "Markdown: yes" \
-            -d "最新热点已抓取完成（$REPORT_TIME），AI分析已生成，[点击查看完整报告]($SITE_URL)"
+            -d "最新热点已抓取完成（$REPORT_TIME），[点击查看完整报告]($SITE_URL)"
           echo "Notification sent!"
