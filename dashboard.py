@@ -595,55 +595,112 @@ def extract_ai_blocks(html_path: Path) -> List[Dict[str, str]]:
     return []
 
 
-def split_bullets(text: str, max_len: int = 120) -> List[str]:
-    """
-    将 AI 板块长文本切分为短要点。
+# 行首【标签】（可带冒号）
+_RE_BRACKET_LABEL = re.compile(r"^【([^】]{1,12})】\s*[:：]?\s*")
+# 行首「短标签：」（冒号后必须还有正文，才算行内标签）
+_RE_INLINE_LABEL = re.compile(r"^([一-龥A-Za-z0-9·/& ]{2,12}?)[:：]\s*(?=\S)")
+# 纯标签行：【标签】[：]  或  短词：（冒号后无正文）
+_RE_LABEL_ONLY = re.compile(
+    r"^(?:【([^】]{1,12})】\s*[:：]?|([一-龥A-Za-z0-9·/& ]{2,12})\s*[:：])\s*$"
+)
+# 序号 / 项目符号前缀：1.  2、  3)  A.  b)  • - * · ▪
+_RE_ITEM_MARKER = re.compile(r"^(?:\d{1,2}[.、)]|[A-Za-z][.、)]|[·•▪◦※*\-–—]+)\s*")
 
-    切分规则：
-        - 换行符切分
-        - 行内序号 "1." "2、" 前断开
-        - 中文句读 "。；！？" 后断开（过短片段保留不切）
-        - 去掉 "• - * · ○ ▪" 等项目符号与序号前缀
-        - 【标签】扁平化为 "标签：" 前缀
+
+def parse_ai_items(text: str, max_len: int = 160) -> List[Dict[str, str]]:
+    """
+    将 AI 板块正文解析为结构化要点 [{"label": 标签, "text": 正文}, ...]。
+
+    修复旧 split_bullets 的文案断裂问题：
+      - 【标签】独占一行时，自动与下一行正文合并，不再出现孤立「标签」
+      - 行首「标签：正文」拆成 chip 标签 + 完整句子
+      - 被换行拆开的同一要点（续行）重新拼回
+      - 空行视为要点分隔；序号 / 项目符号 / 来源标记被清除
+      - 每条保留一句语义完整、结论先行的话
     """
     if not text:
         return []
     text = html_lib.unescape(text)
 
-    # 行内序号前换行（排除小数/版本号，如 2.0）
-    text = re.sub(r"(?<=[^\d.\n])\s*(\d{1,2})[.、]\s*", r"\n\1. ", text)
-    # 句读标点后换行
-    text = re.sub(r"([。；！？])\s*", r"\1\n", text)
-
-    bullets: List[str] = []
-    seen = set()
-    for raw in text.split("\n"):
-        s = raw.strip()
-        if not s:
-            continue
-        # 去项目符号（• · - * ▪ 等）
-        s = re.sub(r"^[·•▪◦※*\-–—]+\s*", "", s)
-        # 去序号前缀
-        s = re.sub(r"^\d{1,2}[.、]\s*", "", s)
-        # 扁平化 【标签】： → 标签：
-        s = re.sub(r"【([^】]+)】\s*[:：]?", r"\1：", s)
+    def clean_line(s: str) -> str:
+        s = s.strip()
         # 去掉来源标记 [微博] [百度] 等
         s = re.sub(r"\[[^\]]{1,10}\]", "", s)
-        s = s.strip("：: \t")
-        # 去掉分句残留的末尾分号/逗号/顿号
-        s = s.rstrip("；;，,、 \t")
-        # 去掉连续标点
-        s = re.sub(r"[：:]{2,}", "：", s)
-        s = s.strip("：: \t")
-        if len(s) < 4:
+        return s.strip()
+
+    items: List[Dict[str, str]] = []
+    pending_label = ""
+    saw_blank = True
+
+    def add_item(label: str, body: str) -> None:
+        body = body.strip().rstrip("；;，,、 \t")
+        label = (label or "").strip()
+        if len(body) < 4:
+            return
+        if len(body) > max_len:
+            body = body[:max_len].rstrip() + "…"
+        for it in items:
+            if it["text"] == body:
+                if label and not it["label"]:
+                    it["label"] = label
+                return
+        items.append({"label": label, "text": body})
+
+    for raw in re.split(r"[\r\n]+", text):
+        s = clean_line(raw)
+        if not s:
+            saw_blank = True
             continue
-        if len(s) > max_len:
-            s = s[:max_len].rstrip() + "…"
-        if s in seen:
+
+        # 1) 纯标签行 → 暂存，与下一正文行合并
+        m_lo = _RE_LABEL_ONLY.match(s)
+        if m_lo and not _RE_ITEM_MARKER.match(s):
+            lbl = (m_lo.group(1) or m_lo.group(2) or "").strip()
+            if lbl:
+                pending_label = lbl
+            saw_blank = False
             continue
-        seen.add(s)
-        bullets.append(s)
-    return bullets
+
+        # 2) 去序号 / 项目符号
+        m_mk = _RE_ITEM_MARKER.match(s)
+        starts_item = bool(m_mk)
+        if starts_item:
+            s = s[m_mk.end():].strip()
+
+        # 3) 拆行首标签
+        label = pending_label
+        pending_label = ""
+        m_b = _RE_BRACKET_LABEL.match(s)
+        if m_b:
+            label = label or m_b.group(1).strip()
+            s = s[m_b.end():].strip()
+        else:
+            m_i = _RE_INLINE_LABEL.match(s)
+            if m_i:
+                label = label or m_i.group(1).strip()
+                s = s[m_i.end():].strip()
+
+        if not s:
+            # 标签后正文落在后续行 → 挂起等待
+            pending_label = label or pending_label
+            saw_blank = False
+            continue
+
+        # 4) 判定新要点 vs 续行：
+        #    有序号 / 有标签 / 前面是空行 / 还没有条目 → 新要点
+        #    否则视为上一条被换行拆开的续行，拼回
+        is_new = starts_item or bool(label) or saw_blank or not items
+        if is_new:
+            add_item(label, s)
+        else:
+            prev = items[-1]
+            prev["text"] = (prev["text"] + s).strip()
+            if label and not prev["label"]:
+                prev["label"] = label
+
+        saw_blank = False
+
+    return items
 
 
 def style_ai_block(title: str) -> Dict[str, Any]:
@@ -1000,6 +1057,126 @@ def cleanup_old_reports() -> None:
 
 
 # ═══════════════════════════════════════════════════════════════
+#  情报时间线（每日摘要沉淀，日积月累）
+# ═══════════════════════════════════════════════════════════════
+
+DIGEST_DIR_NAME = "digest"
+MAX_TIMELINE_DAYS = 30
+
+# 时间线要点的板块优先级：策略建议 > 弱信号 > 核心热点 > 舆论 > RSS
+_DIGEST_CARD_PRIORITY = {
+    "strategy": 0, "signals": 1, "core": 2, "sentiment": 3, "rss": 4,
+}
+
+
+def _digest_dirs(root_dir: Path) -> List[Path]:
+    return [root_dir / REPORTS_GIT_DIR / DIGEST_DIR_NAME,
+            root_dir / REPORTS_SITE_DIR / DIGEST_DIR_NAME]
+
+
+def _digest_headlines(payload: Dict[str, Any], limit: int = 8) -> List[str]:
+    """从载荷视图中抽取高权重头条标题（去重，保序）。"""
+    headlines: List[str] = []
+    seen: set = set()
+    for v in payload.get("views", []):
+        groups = v.get("children") if v.get("type") == "group" else [v]
+        for g in groups:
+            for it in (g.get("items") or [])[:10]:
+                title = (it.get("t") or "").strip()
+                if title and title not in seen:
+                    seen.add(title)
+                    headlines.append(title)
+            if len(headlines) >= limit:
+                return headlines[:limit]
+    return headlines[:limit]
+
+
+def build_daily_digest(payload: Dict[str, Any], target_date: str) -> Dict[str, Any]:
+    """从当日载荷提炼一份结构化摘要（用于时间线积累）。"""
+    ai_cards = (payload.get("ai") or {}).get("cards") or []
+    highlights: List[Dict[str, str]] = []
+    for card in sorted(ai_cards,
+                       key=lambda c: _DIGEST_CARD_PRIORITY.get(c.get("key"), 9)):
+        for it in (card.get("items") or []):
+            highlights.append({
+                "card": card.get("title", ""),
+                "color": card.get("color", "#64748b"),
+                "icon": card.get("icon", "📝"),
+                "label": it.get("label", ""),
+                "text": it.get("text", ""),
+            })
+        if len(highlights) >= 6:
+            break
+    highlights = highlights[:6]
+
+    try:
+        dt = datetime.strptime(target_date, "%Y-%m-%d")
+        date_label = f"{dt.month}月{dt.day}日"
+        weekday = WEEKDAYS_CN[dt.weekday()]
+    except ValueError:
+        date_label, weekday = target_date, ""
+
+    return {
+        "date": target_date,
+        "dateLabel": date_label,
+        "weekday": weekday,
+        "badge": (payload.get("meta") or {}).get("badge", ""),
+        "genTime": (payload.get("meta") or {}).get("genTime", ""),
+        "stats": payload.get("stats", {}),
+        "highlights": highlights,
+        "headlines": _digest_headlines(payload),
+    }
+
+
+def save_daily_digest(digest: Dict[str, Any], root_dir: Path) -> None:
+    """将当日摘要写入 reports/digest/YYYY-MM-DD.json（git 持久化 + 站点各一份）。"""
+    for d in _digest_dirs(root_dir):
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+            out = d / f"{digest['date']}.json"
+            out.write_text(json.dumps(digest, ensure_ascii=False, indent=2),
+                           encoding="utf-8")
+            print(f"  已沉淀当日摘要: {out.relative_to(root_dir)}")
+        except OSError as e:
+            print(f"  [警告] 写入摘要失败 {d}: {e}")
+
+
+def load_timeline(root_dir: Path, limit: int = MAX_TIMELINE_DAYS) -> List[Dict[str, Any]]:
+    """读取历史每日摘要，按日期降序（git 持久化目录为主，站点补充）。"""
+    merged: Dict[str, Path] = {}
+    site_dir = root_dir / REPORTS_SITE_DIR / DIGEST_DIR_NAME
+    git_dir = root_dir / REPORTS_GIT_DIR / DIGEST_DIR_NAME
+    if site_dir.exists():
+        for f in site_dir.glob("*.json"):
+            merged[f.name] = f
+    if git_dir.exists():
+        for f in git_dir.glob("*.json"):
+            merged[f.name] = f   # git 目录覆盖（跨运行积累，历史更全）
+
+    timeline: List[Dict[str, Any]] = []
+    for name in sorted(merged.keys(), reverse=True)[:limit]:
+        try:
+            timeline.append(json.loads(merged[name].read_text(encoding="utf-8")))
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"  [警告] 读取摘要失败 {name}: {e}")
+    return timeline
+
+
+def cleanup_old_digests(root_dir: Path, keep: int = MAX_TIMELINE_DAYS) -> None:
+    """每个摘要目录仅保留最新 keep 天的 JSON，避免日积月累撑大仓库。"""
+    for d in _digest_dirs(root_dir):
+        if not d.exists():
+            continue
+        files = sorted(d.glob("*.json"), reverse=True)
+        for old in files[keep:]:
+            try:
+                old.unlink()
+                print(f"  已清理旧摘要: {old.relative_to(root_dir)}")
+            except OSError:
+                pass
+
+
+# ═══════════════════════════════════════════════════════════════
 #  纯CSS/SVG图表生成
 # ═══════════════════════════════════════════════════════════════
 
@@ -1117,8 +1294,8 @@ def build_payload(
             continue
         ai_found = True
         style = style_ai_block(title)
-        bullets = split_bullets(content)
-        if not bullets:
+        items = parse_ai_items(content)
+        if not items:
             continue
         ai_cards.append({
             "key": style["key"],
@@ -1126,7 +1303,7 @@ def build_payload(
             "icon": style["icon"],
             "color": style["color"],
             "wide": style["wide"],
-            "bullets": bullets,
+            "items": items,
         })
 
     # 图表数据
@@ -1406,6 +1583,77 @@ button { font-family:inherit; cursor:pointer; border:none; background:none; colo
 .ai-placeholder .ph-ico { font-size:34px; opacity:.5; margin-bottom:10px; }
 .ai-placeholder .ph-msg { font-size:13px; margin-top:6px; color:var(--text-3); }
 
+/* AI 要点：标签 chip + 正文 + 实体高亮 */
+.ai-bullets li { display:flex; align-items:baseline; gap:7px; flex-wrap:wrap; }
+.ai-bullets li::before { top:15px; }
+.ai-chip {
+  flex-shrink:0; font-size:11px; font-weight:700; color:var(--cc);
+  background:color-mix(in srgb, var(--cc) 12%, transparent);
+  border:1px solid color-mix(in srgb, var(--cc) 28%, transparent);
+  padding:1px 8px; border-radius:999px; line-height:1.6; white-space:nowrap;
+}
+.ai-text { min-width:0; flex:1 1 200px; }
+mark.hl-bank, mark.hl-money, mark.hl-comp, mark.hl-tech {
+  border-radius:4px; padding:0 2px; font-weight:600; background:transparent;
+}
+mark.hl-bank  { color:#1d4ed8; background:rgba(37,99,235,.12); }
+mark.hl-money { color:#dc2626; background:rgba(220,38,38,.12); font-weight:700; }
+mark.hl-comp  { color:#7c3aed; background:rgba(124,58,237,.12); }
+mark.hl-tech  { color:#0d9488; background:rgba(13,148,136,.12); }
+[data-theme="dark"] mark.hl-bank  { color:#93b4ff; background:rgba(77,141,255,.18); }
+[data-theme="dark"] mark.hl-money { color:#ff8a8a; background:rgba(248,113,113,.16); }
+[data-theme="dark"] mark.hl-comp  { color:#c4b5fd; background:rgba(167,139,250,.16); }
+[data-theme="dark"] mark.hl-tech  { color:#5eead4; background:rgba(45,212,191,.14); }
+
+/* 情报时间线 */
+.tl-intro { font-size:12.5px; color:var(--text-3); margin:2px 0 16px; }
+.tl-rail { position:relative; padding-left:26px; }
+.tl-rail::before {
+  content:""; position:absolute; left:9px; top:8px; bottom:8px; width:2px;
+  background:linear-gradient(180deg, var(--accent), var(--border));
+}
+.tl-day { position:relative; margin-bottom:16px; }
+.tl-node { position:absolute; left:-26px; top:16px; width:20px; display:flex; justify-content:center; }
+.tl-dot-main {
+  width:12px; height:12px; border-radius:50%; background:var(--card-bg);
+  border:3px solid var(--accent); box-shadow:0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent);
+}
+.tl-day:not(.latest) .tl-dot-main { border-color:var(--text-3); box-shadow:none; }
+.tl-card {
+  background:var(--card-bg); border:1px solid var(--border); border-radius:14px;
+  padding:14px 16px; box-shadow:var(--shadow);
+}
+.tl-day.latest .tl-card { border-color:color-mix(in srgb, var(--accent) 40%, var(--border)); }
+.tl-date { display:flex; align-items:center; gap:9px; margin-bottom:9px; }
+.tl-date-big { font-size:15.5px; font-weight:800; color:var(--text); }
+.tl-week { font-size:12px; color:var(--text-3); }
+.tl-badge {
+  font-size:10.5px; font-weight:700; color:#fff; background:var(--accent);
+  padding:1px 8px; border-radius:999px; margin-left:auto;
+}
+.tl-stats { display:flex; flex-wrap:wrap; gap:6px; margin-bottom:9px; }
+.tl-chip {
+  font-size:11.5px; font-weight:600; color:var(--text-2);
+  background:var(--hover); border:1px solid var(--border);
+  padding:2px 9px; border-radius:999px;
+}
+.tl-highlights { list-style:none; margin:0 0 8px; padding:0; }
+.tl-highlights li {
+  position:relative; padding:4px 0 4px 22px; font-size:13px; color:var(--text-2);
+  line-height:1.65; display:flex; align-items:baseline; gap:7px; flex-wrap:wrap;
+}
+.tl-highlights li .tl-ico {
+  position:absolute; left:0; top:5px; font-size:13px; width:16px; text-align:center;
+}
+.tl-headlines { list-style:none; margin:0; padding:0; border-top:1px dashed var(--border); padding-top:8px; }
+.tl-headlines li {
+  position:relative; padding:3px 0 3px 14px; font-size:12px; color:var(--text-3); line-height:1.5;
+}
+.tl-headlines li::before {
+  content:""; position:absolute; left:2px; top:11px; width:4px; height:4px;
+  border-radius:50%; background:var(--text-3); opacity:.5;
+}
+
 /* 图表 - 纯CSS/SVG，无外部依赖 */
 .chart-grid { display:grid; grid-template-columns:1fr 1fr; gap:14px; margin-bottom:8px; }
 .chart-card { background:var(--card-bg); border:1px solid var(--border); border-radius:14px; padding:18px 20px; box-shadow:var(--shadow); }
@@ -1631,6 +1879,9 @@ a.row-title:hover { color:var(--accent); }
   /* ─────────────── 导航 ─────────────── */
   function navEntries(){
     var list = [{id:'briefing', label:'今日简报', icon:'📊', count:null}];
+    if((D.timeline||[]).length){
+      list.push({id:'timeline', label:'情报时间线', icon:'🗓', count:D.timeline.length});
+    }
     (D.views||[]).forEach(function(v){
       list.push({id:v.id, label:v.label, icon:v.icon, count:viewCount(v), child:false});
       if(v.type==='group'){
@@ -1693,6 +1944,8 @@ a.row-title:hover { color:var(--accent); }
     window.scrollTo({top:0});
     if(id==='briefing'){
       content.appendChild(renderBriefing());
+    } else if(id==='timeline'){
+      content.appendChild(renderTimeline());
     } else {
       var v = findView(id);
       content.appendChild(renderListView(v));
@@ -1705,11 +1958,27 @@ a.row-title:hover { color:var(--accent); }
       + ico+'</div><div><div class="stat-val">'+val+'</div><div class="stat-lab">'+label+'</div></div></div>';
   }
 
+  /* 关键实体高亮：金额 / 银行 / 友商 / 技术热点（单次替换，避免重复包裹） */
+  function highlight(text){
+    var s = esc(text);
+    var re = /(\d+(?:\.\d+)?\s*(?:亿元|亿|万元|万|kW|MW|GW|kVA|兆瓦|吉瓦|千伏安))|(浦发银行|兴业银行|民生银行|广发银行|平安银行|光大银行|华夏银行|浙商银行|渤海银行|恒丰银行|中信银行|招商银行|工商银行|建设银行|农业银行|交通银行|邮储银行|国有大行|股份制银行|银行)|(华为|鸿蒙|昇腾|鲲鹏|海思|维谛|艾默生|Vertiv|科士达|KSTAR|伊顿|Eaton|施耐德|Schneider|台达|Delta|中达电通)|(大模型|人工智能|DeepSeek|GPT|Gemini|智能体|Agent|储能|数据中心|智算中心|算力中心|UPS|不间断电源|液冷|算力|信创|东数西算)/g;
+    return s.replace(re, function(m, money, bank, comp, tech){
+      var cls = money ? 'hl-money' : bank ? 'hl-bank' : comp ? 'hl-comp' : 'hl-tech';
+      return '<mark class="'+cls+'">'+m+'</mark>';
+    });
+  }
+
+  function aiItemHTML(it, i){
+    var label = it.label ? '<span class="ai-chip">'+esc(it.label)+'</span>' : '';
+    return '<li class="'+(i>=5?'hidden-bullet':'')+'">'+label
+      + '<span class="ai-text">'+highlight(it.text)+'</span></li>';
+  }
+
   function aiCardHTML(card){
-    var dots = (card.bullets||[]).map(function(b,i){
-      return '<li class="'+(i>=5?'hidden-bullet':'')+'">'+esc(b)+'</li>';
-    }).join('');
-    var expand = (card.bullets||[]).length>5
+    var items = (card.items && card.items.length) ? card.items
+      : (card.bullets||[]).map(function(b){ return {label:'', text:b}; });
+    var dots = items.map(aiItemHTML).join('');
+    var expand = items.length>5
       ? '<button class="ai-expand" onclick="App.toggleBullets(this)">展开更多 ▾</button>' : '';
     return '<div class="ai-card'+(card.wide?' wide':'')+'" style="--cc:'+card.color+';">'
       + '<div class="ai-card-head"><div class="ai-card-ico">'+card.icon+'</div>'
@@ -1760,6 +2029,53 @@ a.row-title:hover { color:var(--accent); }
     hidden.forEach(function(li){ li.style.display = expanded ? 'none' : 'list-item'; });
     btn.setAttribute('data-open', expanded?'0':'1');
     btn.textContent = expanded ? '展开更多 ▾' : '收起 ▴';
+  }
+
+  /* ─────────────── 情报时间线视图 ─────────────── */
+  function renderTimeline(){
+    var el = document.createElement('div');
+    el.className = 'view active';
+    var days = D.timeline || [];
+    var head = '<div class="view-head"><span style="font-size:22px;">🗓</span>'
+      + '<div class="view-title">情报时间线</div>'
+      + '<span class="view-count">'+days.length+' 天</span></div>';
+    if(!days.length){
+      el.innerHTML = head + '<div class="empty-hint">时间线将从今天起逐日沉淀，每次生成简报后自动积累当日要点，形成你的销售信息网络。</div>';
+      return el;
+    }
+    var html = '<div class="tl-intro">每日情报自动沉淀为一张卡片，日积月累形成你的销售信息网络，向下滚动即可回溯每一天。</div>';
+    html += '<div class="tl-rail">';
+    days.forEach(function(day, i){
+      var st = day.stats || {};
+      var chips = '<div class="tl-stats">'
+        + '<span class="tl-chip">📈 '+(st.news||0)+' 热点</span>'
+        + '<span class="tl-chip">🎯 '+(st.hit||0)+' 命中</span>'
+        + '<span class="tl-chip">⚡ '+(st.new||0)+' 新增</span>'
+        + '<span class="tl-chip">📰 '+(st.rss||0)+' 资讯</span></div>';
+      var hs = (day.highlights||[]).map(function(h){
+        var color = h.color || '#64748b';
+        var chip = h.label
+          ? '<span class="ai-chip" style="--cc:'+color+';">'+esc(h.label)+'</span>' : '';
+        return '<li><span class="tl-ico">'+(h.icon||'📝')+'</span>'+chip
+          + '<span class="ai-text">'+highlight(h.text)+'</span></li>';
+      }).join('');
+      var heads = (day.headlines||[]).slice(0,5).map(function(t){
+        return '<li>'+esc(t)+'</li>';
+      }).join('');
+      html += '<div class="tl-day'+(i===0?' latest':'')+'">'
+        + '<div class="tl-node"><div class="tl-dot-main"></div></div>'
+        + '<div class="tl-card">'
+        + '<div class="tl-date"><span class="tl-date-big">'+esc(day.dateLabel||day.date)+'</span>'
+        + '<span class="tl-week">'+esc(day.weekday||'')+'</span>'
+        + (i===0?'<span class="tl-badge">最新</span>':'')+'</div>'
+        + chips
+        + (hs?'<ul class="tl-highlights">'+hs+'</ul>':'')
+        + (heads?'<ul class="tl-headlines">'+heads+'</ul>':'')
+        + '</div></div>';
+    });
+    html += '</div>';
+    el.innerHTML = head + html;
+    return el;
   }
 
   /* ─────────────── 列表视图 ─────────────── */
@@ -2031,6 +2347,13 @@ def main() -> int:
 
     payload = build_payload(news_data, rss_groups, ai_blocks, history,
                             target_date, data_date)
+
+    # 沉淀当日摘要 → 加载累计时间线（日积月累，形成销售信息网络）
+    digest = build_daily_digest(payload, data_date or target_date)
+    save_daily_digest(digest, root_dir)
+    payload["timeline"] = load_timeline(root_dir)
+    print(f"  情报时间线已累计 {len(payload['timeline'])} 天")
+
     html = build_html(payload)
 
     index_out = site_dir / "index.html"
@@ -2046,6 +2369,7 @@ def main() -> int:
     print(f"  已备份: {git_report.relative_to(root_dir)}（git 持久化）")
 
     cleanup_old_reports()
+    cleanup_old_digests(root_dir)
 
     print("\n" + "=" * 60)
     print("  仪表盘生成完成！")
