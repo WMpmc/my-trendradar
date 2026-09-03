@@ -627,9 +627,14 @@ def split_bullets(text: str, max_len: int = 120) -> List[str]:
         s = re.sub(r"^\d{1,2}[.、]\s*", "", s)
         # 扁平化 【标签】： → 标签：
         s = re.sub(r"【([^】]+)】\s*[:：]?", r"\1：", s)
+        # 去掉来源标记 [微博] [百度] 等
+        s = re.sub(r"\[[^\]]{1,10}\]", "", s)
         s = s.strip("：: \t")
         # 去掉分句残留的末尾分号/逗号/顿号
         s = s.rstrip("；;，,、 \t")
+        # 去掉连续标点
+        s = re.sub(r"[：:]{2,}", "：", s)
+        s = s.strip("：: \t")
         if len(s) < 4:
             continue
         if len(s) > max_len:
@@ -995,6 +1000,99 @@ def cleanup_old_reports() -> None:
 
 
 # ═══════════════════════════════════════════════════════════════
+#  纯CSS/SVG图表生成
+# ═══════════════════════════════════════════════════════════════
+
+def _build_charts_html(pie: List[Dict], bar: List[Dict]) -> str:
+    """生成纯HTML/CSS/SVG图表，不依赖任何外部CDN。"""
+    import html as _h
+
+    # ── 环形图（SVG stroke-dasharray） ──
+    total_pie = sum(d["value"] for d in pie) or 1
+    colors = CATEGORY_PALETTE[:len(pie)]
+    while len(colors) < len(pie):
+        colors.append("#8b96ab")
+
+    r = 52
+    circumference = 2 * 3.14159 * r
+    offset = 0.0
+    segments = []
+    for i, d in enumerate(pie):
+        frac = d["value"] / total_pie
+        dash = frac * circumference
+        seg_color = colors[i % len(colors)]
+        segments.append(
+            f'<circle cx="70" cy="70" r="{r}" fill="none" '
+            f'stroke="{seg_color}" stroke-width="16" '
+            f'stroke-dasharray="{dash:.1f} {circumference - dash:.1f}" '
+            f'stroke-dashoffset="{-offset:.1f}" '
+            f'transform="rotate(-90 70 70)" style="transition:stroke-dasharray .6s"/>'
+        )
+        offset += dash
+
+    donut_svg = (
+        f'<svg class="donut-svg" width="140" height="140" viewBox="0 0 140 140">'
+        f'{"".join(segments)}'
+        f'<text x="70" y="66" text-anchor="middle" class="donut-center">{total_pie}</text>'
+        f'<text x="70" y="82" text-anchor="middle" class="donut-center-label">条命中</text>'
+        f'</svg>'
+    )
+
+    legend_items = []
+    for i, d in enumerate(pie):
+        pct = round(d["value"] / total_pie * 100)
+        legend_items.append(
+            f'<div class="donut-legend-item">'
+            f'<span class="donut-dot" style="background:{colors[i % len(colors)]}"></span>'
+            f'<span class="donut-name">{_h.escape(d["name"])}</span>'
+            f'<span class="donut-val">{d["value"]}条 · {pct}%</span>'
+            f'</div>'
+        )
+
+    donut_html = (
+        f'<div class="chart-card">'
+        f'<div class="chart-title">分类分布</div>'
+        f'<div class="donut-wrap">{donut_svg}'
+        f'<div class="donut-legend">{"".join(legend_items)}</div>'
+        f'</div></div>'
+    )
+
+    # ── 横向柱状图（CSS） ──
+    max_val = max((d["value"] for d in bar), default=1) or 1
+    bar_colors = [
+        "linear-gradient(90deg,#1d4ed8,#60a5fa)",
+        "linear-gradient(90deg,#0891b2,#22d3ee)",
+        "linear-gradient(90deg,#7c3aed,#a78bfa)",
+        "linear-gradient(90deg,#dc2626,#f87171)",
+        "linear-gradient(90deg,#ea580c,#fb923c)",
+        "linear-gradient(90deg,#16a34a,#4ade80)",
+        "linear-gradient(90deg,#0d9488,#2dd4bf)",
+        "linear-gradient(90deg,#4f46e5,#818cf8)",
+    ]
+    bar_rows = []
+    for i, d in enumerate(bar):
+        pct_width = max(8, round(d["value"] / max_val * 100))
+        color = bar_colors[i % len(bar_colors)]
+        bar_rows.append(
+            f'<div class="bar-row">'
+            f'<span class="bar-name">{_h.escape(d["name"])}</span>'
+            f'<div class="bar-track">'
+            f'<div class="bar-fill" style="width:{pct_width}%;background:{color}">'
+            f'<span class="bar-num">{d["value"]}</span>'
+            f'</div></div></div>'
+        )
+
+    bar_html = (
+        f'<div class="chart-card">'
+        f'<div class="chart-title">平台新闻数 Top 8</div>'
+        f'<div class="bar-list">{"".join(bar_rows)}</div>'
+        f'</div>'
+    )
+
+    return f'<div class="chart-grid">{donut_html}{bar_html}</div>'
+
+
+# ═══════════════════════════════════════════════════════════════
 #  数据载荷
 # ═══════════════════════════════════════════════════════════════
 
@@ -1039,6 +1137,9 @@ def build_payload(
         top.append({"name": "其他", "value": sum(d["value"] for d in pie[8:])})
         pie = top
     bar = [{"name": n, "value": v} for n, v in news_data["sorted_platforms"][:8]]
+
+    # 生成纯CSS/SVG图表HTML（不依赖外部CDN）
+    charts_html = _build_charts_html(pie, bar)
 
     # 销售视图
     sales_views = build_sales_views(news_data)
@@ -1092,6 +1193,7 @@ def build_payload(
             "cards": ai_cards,
         },
         "charts": {"pie": pie, "bar": bar, "palette": CATEGORY_PALETTE},
+        "chartsHtml": charts_html,
         "views": nav_views,
         "history": history,
     }
@@ -1108,7 +1210,6 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>TrendRadar 销售情报简报</title>
-<script src="__ECHARTS_CDN__"></script>
 <style>
 /* ───────────────────────────── 主题变量 ───────────────────────────── */
 :root {
@@ -1255,42 +1356,48 @@ button { font-family:inherit; cursor:pointer; border:none; background:none; colo
 /* 统计卡 */
 .stat-grid { display:grid; grid-template-columns:repeat(4,1fr); gap:14px; margin:18px 0 22px; }
 .stat-card {
-  background:var(--card-bg); border:1px solid var(--border); border-radius:12px;
-  padding:14px 16px; display:flex; align-items:center; gap:12px; box-shadow:var(--shadow);
+  background:var(--card-bg); border:1px solid var(--border); border-radius:14px;
+  padding:16px 18px; display:flex; align-items:center; gap:13px;
+  box-shadow:0 1px 3px rgba(16,24,40,.04), 0 1px 2px rgba(16,24,40,.06);
+  transition:box-shadow .2s, transform .2s;
 }
-.stat-ico { width:38px; height:38px; border-radius:10px; display:flex; align-items:center; justify-content:center; font-size:18px; flex:none; }
-.stat-val { font-size:22px; font-weight:800; line-height:1.1; }
-.stat-lab { font-size:12px; color:var(--text-3); margin-top:2px; }
+.stat-card:hover { box-shadow:0 4px 12px rgba(16,24,40,.08); transform:translateY(-1px); }
+.stat-ico { width:42px; height:42px; border-radius:12px; display:flex; align-items:center; justify-content:center; font-size:19px; flex:none; }
+.stat-val { font-size:24px; font-weight:800; line-height:1.1; letter-spacing:-.5px; }
+.stat-lab { font-size:12px; color:var(--text-3); margin-top:3px; font-weight:500; }
 
 /* AI 卡片 */
 .ai-grid { display:grid; grid-template-columns:repeat(2,1fr); gap:14px; margin-bottom:22px; }
 .ai-card {
   background:var(--card-bg); border:1px solid var(--border); border-left:4px solid var(--cc);
-  border-radius:12px; padding:15px 17px; box-shadow:var(--shadow); position:relative;
+  border-radius:14px; padding:17px 19px;
+  box-shadow:0 1px 3px rgba(16,24,40,.04), 0 1px 2px rgba(16,24,40,.06);
+  position:relative; transition:box-shadow .2s;
 }
-.ai-card.wide { grid-column:span 2; background:linear-gradient(180deg, color-mix(in srgb, var(--cc) 7%, var(--card-bg)), var(--card-bg)); }
-.ai-card-head { display:flex; align-items:center; gap:9px; margin-bottom:10px; }
+.ai-card:hover { box-shadow:0 4px 14px rgba(16,24,40,.08); }
+.ai-card.wide { grid-column:span 2; background:linear-gradient(180deg, color-mix(in srgb, var(--cc) 6%, var(--card-bg)), var(--card-bg)); border-left-width:5px; }
+.ai-card-head { display:flex; align-items:center; gap:10px; margin-bottom:12px; }
 .ai-card-ico {
-  width:30px; height:30px; border-radius:8px; flex:none; font-size:15px;
+  width:32px; height:32px; border-radius:9px; flex:none; font-size:16px;
   display:flex; align-items:center; justify-content:center;
-  background:color-mix(in srgb, var(--cc) 14%, transparent);
+  background:color-mix(in srgb, var(--cc) 13%, transparent);
 }
-.ai-card-title { font-size:15px; font-weight:700; color:var(--cc); }
+.ai-card-title { font-size:15px; font-weight:700; color:var(--cc); letter-spacing:.2px; }
 .ai-card-tag { margin-left:auto; font-size:10.5px; font-weight:700; color:var(--cc);
-  background:color-mix(in srgb, var(--cc) 12%, transparent); padding:2px 8px; border-radius:10px; }
+  background:color-mix(in srgb, var(--cc) 12%, transparent); padding:3px 9px; border-radius:11px; }
 .ai-bullets { list-style:none; }
 .ai-bullets li {
-  position:relative; padding:4px 0 4px 16px; font-size:13px; color:var(--text-2);
-  line-height:1.65;
+  position:relative; padding:5px 0 5px 17px; font-size:13px; color:var(--text-2);
+  line-height:1.7;
 }
 .ai-bullets li::before {
-  content:""; position:absolute; left:2px; top:12px; width:6px; height:6px;
-  border-radius:50%; background:var(--cc);
+  content:""; position:absolute; left:2px; top:13px; width:6px; height:6px;
+  border-radius:50%; background:var(--cc); opacity:.7;
 }
 .ai-bullets li.hidden-bullet { display:none; }
 .ai-expand {
-  margin-top:8px; font-size:12.5px; font-weight:600; color:var(--cc);
-  padding:4px 0; display:inline-flex; align-items:center; gap:4px;
+  margin-top:9px; font-size:12.5px; font-weight:600; color:var(--cc);
+  padding:5px 0; display:inline-flex; align-items:center; gap:4px;
 }
 .ai-placeholder {
   grid-column:span 2; background:var(--card-bg); border:1px dashed var(--border);
@@ -1299,11 +1406,28 @@ button { font-family:inherit; cursor:pointer; border:none; background:none; colo
 .ai-placeholder .ph-ico { font-size:34px; opacity:.5; margin-bottom:10px; }
 .ai-placeholder .ph-msg { font-size:13px; margin-top:6px; color:var(--text-3); }
 
-/* 图表 */
+/* 图表 - 纯CSS/SVG，无外部依赖 */
 .chart-grid { display:grid; grid-template-columns:1fr 1fr; gap:14px; margin-bottom:8px; }
-.chart-card { background:var(--card-bg); border:1px solid var(--border); border-radius:12px; padding:14px 16px; box-shadow:var(--shadow); }
-.chart-title { font-size:13.5px; font-weight:700; color:var(--text-2); margin-bottom:6px; }
-.chart-box { height:250px; width:100%; }
+.chart-card { background:var(--card-bg); border:1px solid var(--border); border-radius:14px; padding:18px 20px; box-shadow:var(--shadow); }
+.chart-title { font-size:13.5px; font-weight:700; color:var(--text-2); margin-bottom:12px; display:flex; align-items:center; gap:6px; }
+.chart-title::before { content:''; width:3px; height:14px; border-radius:2px; background:var(--accent); }
+/* 环形图 */
+.donut-wrap { display:flex; align-items:center; gap:14px; }
+.donut-svg { flex-shrink:0; }
+.donut-legend { flex:1; display:flex; flex-direction:column; gap:5px; min-width:0; }
+.donut-legend-item { display:flex; align-items:center; gap:7px; font-size:12px; color:var(--text-2); }
+.donut-dot { width:8px; height:8px; border-radius:50%; flex-shrink:0; }
+.donut-name { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.donut-val { font-weight:700; font-size:12px; color:var(--text-1); flex-shrink:0; }
+.donut-center { font-size:20px; font-weight:800; fill:var(--text-1); }
+.donut-center-label { font-size:10px; fill:var(--text-3); }
+/* 横向柱状图 */
+.bar-list { display:flex; flex-direction:column; gap:7px; }
+.bar-row { display:flex; align-items:center; gap:8px; font-size:12px; }
+.bar-name { width:64px; flex-shrink:0; color:var(--text-2); text-align:right; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.bar-track { flex:1; height:18px; background:var(--bg); border-radius:9px; overflow:hidden; position:relative; }
+.bar-fill { height:100%; border-radius:9px; transition:width .6s ease; display:flex; align-items:center; justify-content:flex-end; padding-right:6px; min-width:24px; }
+.bar-num { font-size:10.5px; font-weight:700; color:#fff; }
 
 /* 视图标题 */
 .view-head { display:flex; align-items:center; gap:10px; margin:4px 0 14px; }
@@ -1468,7 +1592,7 @@ a.row-title:hover { color:var(--accent); }
 (function(){
   'use strict';
   var D = window.DASH_DATA || {};
-  var state = { view:'briefing', charts:{}, inited:false };
+  var state = { view:'briefing', inited:false };
 
   function esc(s){
     return String(s==null?'':s).replace(/[&<>"']/g, function(c){
@@ -1481,7 +1605,6 @@ a.row-title:hover { color:var(--accent); }
   function setTheme(t){
     document.documentElement.setAttribute('data-theme', t);
     localStorage.setItem('tr-theme', t);
-    setTimeout(renderCharts, 60);
   }
   function toggleTheme(){ setTheme(getTheme()==='dark' ? 'light' : 'dark'); }
 
@@ -1570,7 +1693,6 @@ a.row-title:hover { color:var(--accent); }
     window.scrollTo({top:0});
     if(id==='briefing'){
       content.appendChild(renderBriefing());
-      setTimeout(renderCharts, 80);
     } else {
       var v = findView(id);
       content.appendChild(renderListView(v));
@@ -1625,10 +1747,7 @@ a.row-title:hover { color:var(--accent); }
         + '<div class="ph-msg">'+esc(ai.message||'运行 TrendRadar AI 分析后，此处将展示核心热点、舆论风向、弱信号、RSS 洞察与策略建议五个板块')+'</div></div></div>';
     }
 
-    html += '<div class="chart-grid">'
-      + '<div class="chart-card"><div class="chart-title">分类分布</div><div class="chart-box" id="chartPie"></div></div>'
-      + '<div class="chart-card"><div class="chart-title">平台新闻数 Top 8</div><div class="chart-box" id="chartBar"></div></div>'
-      + '</div>';
+    html += (D.chartsHtml || '');
 
     el.innerHTML = html;
     return el;
@@ -1804,59 +1923,8 @@ a.row-title:hover { color:var(--accent); }
     return el;
   }
 
-  /* ─────────────── 图表 ─────────────── */
-  function isDark(){ return document.documentElement.getAttribute('data-theme')==='dark'; }
-  function cText(){ return isDark() ? '#9fadc6' : '#55617a'; }
-  function cLine(){ return isDark() ? '#1e2c46' : '#e4e9f2'; }
-  function cSplit(){ return isDark() ? '#16233d' : '#eef2f8'; }
-  function cTipBg(){ return isDark() ? '#111d33' : '#fff'; }
+  /* 图表已改为纯CSS/SVG，无需JS初始化 */
 
-  function renderCharts(){
-    if(typeof echarts==='undefined') return;
-    if(state.view!=='briefing') return;
-    var pieEl = document.getElementById('chartPie');
-    var barEl = document.getElementById('chartBar');
-    var palette = (D.charts&&D.charts.palette) || [];
-
-    if(pieEl){
-      if(!state.charts.pie) state.charts.pie = echarts.init(pieEl);
-      state.charts.pie.setOption({
-        tooltip:{trigger:'item', backgroundColor:cTipBg(), borderColor:cLine(),
-          textStyle:{color:cText(), fontSize:12}},
-        legend:{bottom:0, type:'scroll', textStyle:{color:cText(), fontSize:11}, itemWidth:10, itemHeight:10},
-        color: palette.concat(['#8b96ab']),
-        series:[{type:'pie', radius:['45%','70%'], center:['50%','42%'],
-          itemStyle:{borderRadius:5, borderColor:isDark()?'#111d33':'#fff', borderWidth:2},
-          label:{show:false},
-          emphasis:{label:{show:true, fontSize:13, fontWeight:'bold', color:cText()}},
-          data:(D.charts&&D.charts.pie)||[]}]
-      }, true);
-    }
-    if(barEl){
-      if(!state.charts.bar) state.charts.bar = echarts.init(barEl);
-      var d = ((D.charts&&D.charts.bar)||[]).slice().reverse();
-      state.charts.bar.setOption({
-        tooltip:{trigger:'axis', axisPointer:{type:'shadow'}, backgroundColor:cTipBg(),
-          borderColor:cLine(), textStyle:{color:cText(), fontSize:12}},
-        grid:{left:8, right:30, top:8, bottom:8, containLabel:true},
-        xAxis:{type:'value', axisLine:{lineStyle:{color:cLine()}},
-          axisLabel:{color:cText(), fontSize:11}, splitLine:{lineStyle:{color:cSplit()}}},
-        yAxis:{type:'category', data:d.map(function(x){return x.name;}),
-          axisLine:{lineStyle:{color:cLine()}}, axisTick:{show:false},
-          axisLabel:{color:cText(), fontSize:11.5, width:92, overflow:'truncate'}},
-        series:[{type:'bar', data:d.map(function(x){return x.value;}), barWidth:'58%',
-          itemStyle:{borderRadius:[0,4,4,0],
-            color:new echarts.graphic.LinearGradient(0,0,1,0,[
-              {offset:0,color:'#1d4ed8'},{offset:1,color:'#60a5fa'}])},
-          label:{show:true, position:'right', color:cText(), fontSize:11}}]
-      }, true);
-    }
-    Object.keys(state.charts).forEach(function(k){ state.charts[k].resize(); });
-  }
-
-  window.addEventListener('resize', function(){
-    Object.keys(state.charts).forEach(function(k){ if(state.charts[k]) state.charts[k].resize(); });
-  });
   window.addEventListener('scroll', function(){
     document.getElementById('backTop').classList.toggle('show', window.pageYOffset>400);
   });
@@ -1885,8 +1953,7 @@ def build_html(payload: Dict[str, Any]) -> str:
     data_json = json.dumps(payload, ensure_ascii=False)
     # 防止 </script> 注入破坏页面
     data_json = data_json.replace("</", "<\\/")
-    return _HTML_TEMPLATE.replace("__ECHARTS_CDN__", ECHARTS_CDN) \
-                         .replace("__DATA__", data_json)
+    return _HTML_TEMPLATE.replace("__DATA__", data_json)
 
 
 # ═══════════════════════════════════════════════════════════════
