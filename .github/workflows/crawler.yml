@@ -10,7 +10,7 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
-  contents: read
+  contents: write
   actions: write
   pages: write
   id-token: write
@@ -26,6 +26,7 @@ jobs:
         with:
           fetch-depth: 1
           clean: true
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Check Expiration
         env:
@@ -73,11 +74,11 @@ jobs:
         if: success()
         run: |
           if [ ! -f config/config.yaml ]; then
-            echo "Error: Config missing"
+            echo "Error: config/config.yaml missing"
             exit 1
           fi
           if [ ! -f dashboard.py ]; then
-            echo "Error: dashboard.py missing - please upload it"
+            echo "Error: dashboard.py missing"
             exit 1
           fi
 
@@ -94,8 +95,30 @@ jobs:
         if: success()
         run: |
           python dashboard.py
-          echo "Dashboard generated!"
+          echo "=== Dashboard output ==="
           ls -la _site/
+          ls -la _site/reports/ 2>/dev/null || echo "No reports dir"
+          ls -la reports/ 2>/dev/null || echo "No persistent reports dir yet"
+
+      - name: Commit historical reports
+        if: success()
+        run: |
+          mkdir -p reports
+          if [ -d "_site/reports" ]; then
+            cp -f _site/reports/*.html reports/ 2>/dev/null || true
+          fi
+          # Keep only latest 60 reports
+          ls -t reports/*.html 2>/dev/null | tail -n +61 | xargs -r rm -f
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add reports/
+          if git diff --cached --quiet; then
+            echo "No new reports to commit"
+          else
+            git commit -m "📊 Add report $(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M')"
+            git push
+            echo "Reports committed and pushed"
+          fi
 
       - name: Setup Pages
         if: success()
