@@ -1,24 +1,40 @@
 # coding=utf-8
 """
-TrendRadar 情报仪表盘生成器
-==========================
+TrendRadar 销售情报仪表盘 —— 「早间简报」版
+=============================================
 
-从 TrendRadar 的 SQLite 数据库生成美观的现代化 HTML 仪表盘。
-在爬虫运行后由 GitHub Actions 调用，也支持本地（Windows / Ubuntu）运行。
+为科华（Kehua）UPS 销售（广东区 · 股份制银行方向）打造的每日情报仪表盘。
 
-功能概览：
-- 读取当日热榜新闻数据库与 RSS 数据库
-- 解析 frequency_words.txt 进行关键词分类
-- 从 TrendRadar 生成的 index.html 中提取 AI 分析
-- 生成自包含的 HTML 仪表盘（ECharts 图表、明暗主题、响应式布局）
-- 归档历史报告至 _site/reports/，最多保留 60 份
+数据流：
+    output/news/YYYY-MM-DD.db   热榜新闻（news_items / platforms / rank_history ...）
+    output/rss/YYYY-MM-DD.db    RSS 资讯（rss_items / rss_feeds）
+    config/frequency_words.txt  关键词分类配置
+    index.html                  TrendRadar 生成的报告（从中提取 AI 分析五板块）
+
+产出：
+    _site/index.html                     最新仪表盘（GitHub Pages 入口）
+    _site/reports/YYYY-MM-DD-HHMM.html   归档副本（站点内）
+    reports/YYYY-MM-DD-HHMM.html         归档副本（提交 git，跨运行持久化）
+
+设计要点：
+    - 默认落地页为「今日简报」：日期大标题 + 统计卡 + AI 五张彩色卡片 + 两张小图表
+    - 左侧固定导航（移动端为顶部横向标签栏），JS 无刷新切换视图
+    - 新闻为紧凑单行列表（类邮箱收件箱），一屏可浏览多条
+    - 销售优先导航：商机信号 / 科华动态 / 股份制银行 / UPS与电源 / 数据中心 /
+      AI与大模型 / 友商动态（华为·维谛·科士达·伊顿·施耐德·台达）/ 行业资讯 / 总榜
+    - 明暗双主题、历史报告下拉、回到顶部、移动端响应式
 
 用法：
-    python dashboard.py
+    python dashboard.py                  # 生成今日简报
+    python dashboard.py --date 2025-12-27  # 重新生成指定日期（补票/调试用）
+
+仅依赖标准库（sqlite3 / json / re / html.parser / pathlib / datetime）。
+跨平台：Windows + Ubuntu。时区：Asia/Shanghai (UTC+8)。
 """
 
 from __future__ import annotations
 
+import html as html_lib
 import json
 import re
 import sqlite3
@@ -31,137 +47,163 @@ from typing import Any, Dict, List, Optional, Tuple
 
 
 # ═══════════════════════════════════════════════════════════════
-#  常量定义
+#  常量
 # ═══════════════════════════════════════════════════════════════
 
-# 上海时区（UTC+8）
 SHANGHAI_TZ = timezone(timedelta(hours=8))
 
-# 站点输出目录（GitHub Pages 部署目录）
 SITE_DIR = Path("_site")
-REPORTS_DIR = SITE_DIR / "reports"
+REPORTS_SITE_DIR = SITE_DIR / "reports"     # 站点内归档（随 Pages 部署）
+REPORTS_GIT_DIR = Path("reports")          # git 持久化归档（跨运行保留）
 
-# 最多保留的历史报告数量
 MAX_HISTORY_REPORTS = 60
-
-# ECharts CDN
 ECHARTS_CDN = "https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"
 
-# 分类配色方案（10 色循环）
+# 分类配色（图表 / 标签循环用）
 CATEGORY_PALETTE = [
-    "#1677ff", "#52c41a", "#faad14", "#f5222d", "#722ed1",
-    "#13c2c2", "#eb2f96", "#fa8c16", "#2f54eb", "#a0d911",
+    "#2563eb", "#16a34a", "#f97316", "#dc2626", "#9333ea",
+    "#0d9488", "#db2777", "#ca8a04", "#4f46e5", "#65a30d",
 ]
 
-# 平台标签配色（15 色循环，通过哈希稳定分配）
-PLATFORM_PALETTE = [
-    "#1677ff", "#52c41a", "#faad14", "#f5222d", "#722ed1",
-    "#13c2c2", "#eb2f96", "#fa8c16", "#2f54eb", "#a0d911",
-    "#e91869", "#08979c", "#c41d7f", "#ad8b00", "#1d39c4",
+# 友商品牌关键词（标题扫描用，小写匹配）
+COMPETITORS: List[Tuple[str, str, List[str]]] = [
+    ("comp-huawei", "华为", ["华为", "鸿蒙", "昇腾", "鲲鹏", "海思", "任正非",
+                            "余承东", "huawei", "harmonyos", "数字能源"]),
+    ("comp-vertiv", "维谛", ["维谛", "vertiv", "艾默生"]),
+    ("comp-kstar", "科士达", ["科士达", "kstar"]),
+    ("comp-eaton", "伊顿", ["伊顿", "eaton"]),
+    ("comp-schneider", "施耐德", ["施耐德", "schneider", "apc"]),
+    ("comp-delta", "台达", ["台达", "中达电通", "delta"]),
 ]
 
-# 排名前三的奖牌色
-MEDAL_COLORS: Dict[int, str] = {
-    1: "#fbbf24",  # 金牌
-    2: "#cbd5e1",  # 银牌
-    3: "#d97706",  # 铜牌
-}
+# 销售优先固定视图：(视图id, 名称, 图标, 分类名关键词, 标题关键词)
+# 分类名命中即「认领」该分类（不再出现在其他分类中）；标题命中为补充抓取。
+FIXED_VIEWS: List[Dict[str, Any]] = [
+    {
+        "id": "kehua", "label": "科华动态", "icon": "🏢",
+        "cat_kw": ["科华", "kehua"],
+        "title_kw": ["科华", "kehua", "科华数据", "科华技术"],
+        "title_re": None,
+    },
+    {
+        "id": "banks", "label": "股份制银行", "icon": "🏦",
+        "cat_kw": ["银行"],
+        "title_kw": ["银行", "浦发", "兴业银行", "民生银行", "广发银行",
+                     "平安银行", "光大银行", "华夏银行", "浙商银行", "渤海银行",
+                     "恒丰银行", "中信银行", "招商银行", "股份制"],
+        "title_re": None,
+    },
+    {
+        "id": "ups", "label": "UPS与电源", "icon": "⚡",
+        "cat_kw": ["ups", "电源", "蓄电池", "储能", "配电"],
+        "title_kw": ["ups", "不间断电源", "蓄电池", "锂电", "储能", "电源",
+                     "配电", "逆变器", "微模块", "光伏", "充电桩"],
+        "title_re": None,
+    },
+    {
+        "id": "idc", "label": "数据中心", "icon": "🏭",
+        "cat_kw": ["数据中心", "idc", "机房", "算力"],
+        "title_kw": ["数据中心", "idc", "智算中心", "算力中心", "机房",
+                     "东数西算", "服务器", "液冷"],
+        "title_re": None,
+    },
+    {
+        "id": "ai", "label": "AI与大模型", "icon": "🤖",
+        "cat_kw": ["大模型", "人工智能"],
+        "title_kw": ["大模型", "人工智能", "gpt", "deepseek", "智能体", "agent"],
+        "title_re": re.compile(r"(?<![a-z])ai(?![a-z])"),
+        "cat_re": re.compile(r"(?<![a-z])ai(?![a-z])"),
+    },
+]
+
+# AI 五板块样式：(标题关键词组, key, 颜色, 图标, 是否高亮加宽)
+AI_BLOCK_STYLES: List[Tuple[Tuple[str, ...], str, str, str, bool]] = [
+    (("核心热点", "热点态势", "热点"), "core", "#2563eb", "📈", False),
+    (("舆论", "争议", "风向", "情绪"), "sentiment", "#f97316", "💬", False),
+    (("异动", "弱信号", "信号"), "signals", "#9333ea", "🔎", False),
+    (("rss", "洞察", "深度"), "rss", "#0d9488", "📰", False),
+    (("研判", "策略", "建议", "行动", "展望"), "strategy", "#16a34a", "🎯", True),
+]
+AI_BLOCK_DEFAULT = ("other", "#64748b", "📝", False)
+
+WEEKDAYS_CN = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
 
 
 # ═══════════════════════════════════════════════════════════════
-#  工具函数
+#  时间工具
 # ═══════════════════════════════════════════════════════════════
 
 def now_shanghai() -> datetime:
-    """获取当前上海时间。"""
     return datetime.now(SHANGHAI_TZ)
 
 
 def today_str() -> str:
-    """返回当日日期字符串 YYYY-MM-DD（上海时区）。"""
     return now_shanghai().strftime("%Y-%m-%d")
 
 
 def now_display() -> str:
-    """返回当前日期时间字符串，用于页面展示。"""
     return now_shanghai().strftime("%Y-%m-%d %H:%M")
 
 
 def timestamp_label() -> str:
-    """返回用于归档文件名的时间戳 YYYY-MM-DD-HHMM。"""
     return now_shanghai().strftime("%Y-%m-%d-%H%M")
 
 
-def format_hhmm(time_str: Optional[str]) -> str:
-    """
-    将数据库中的时间字段格式化为 HH:MM。
+def briefing_badge(hour: int) -> str:
+    """根据小时返回简报时段徽章。"""
+    if 5 <= hour < 11:
+        return "早间简报"
+    if 11 <= hour < 14:
+        return "午间简报"
+    return "晚间简报"
 
-    数据库中 first_crawl_time / last_crawl_time 可能存储为
-    "HH-MM" 格式（如 "07-41"）或完整时间戳，此处统一格式化。
-    """
+
+def format_hhmm(time_str: Optional[str]) -> str:
+    """将数据库时间字段统一格式化为 HH:MM（兼容 'HH-MM' 与完整时间戳）。"""
     if not time_str:
         return "--:--"
     time_str = str(time_str).strip()
-    # "HH-MM" → "HH:MM"
     m = re.match(r"^(\d{1,2})-(\d{2})$", time_str)
     if m:
         return f"{int(m.group(1)):02d}:{m.group(2)}"
-    # 完整时间戳 "YYYY-MM-DD HH:MM:SS" → "HH:MM"
-    m = re.match(r"^\d{4}-\d{2}-\d{2}\s+(\d{1,2}:\d{2})", time_str)
+    m = re.match(r"^\d{4}-\d{2}-\d{2}[T\s](\d{1,2}):(\d{2})", time_str)
     if m:
-        return m.group(1)
-    # "HH:MM" 已经是目标格式
+        return f"{int(m.group(1)):02d}:{m.group(2)}"
     m = re.match(r"^(\d{1,2}):(\d{2})$", time_str)
     if m:
         return f"{int(m.group(1)):02d}:{m.group(2)}"
     return time_str
 
 
-def truncate(text: str, length: int = 20) -> str:
-    """截断文本到指定长度，超出部分用省略号表示。"""
-    if not text:
+def format_pub_time(pub: str) -> str:
+    """RSS published_at → 'MM-DD HH:MM' 紧凑展示。"""
+    if not pub:
         return ""
-    text = text.strip()
-    if len(text) <= length:
-        return text
-    return text[:length] + "..."
-
-
-def color_for_index(index: int, palette: List[str]) -> str:
-    """根据索引从调色板中循环取色。"""
-    return palette[index % len(palette)]
-
-
-def color_for_platform(platform_id: str) -> str:
-    """根据平台 ID 稳定地分配一个标签颜色（跨进程确定性）。"""
-    # 使用确定性哈希，避免 Python 内置 hash() 的随机化导致颜色每次运行不同
-    h = 0
-    for ch in platform_id:
-        h = (h * 31 + ord(ch)) & 0xFFFFFFFF
-    return PLATFORM_PALETTE[h % len(PLATFORM_PALETTE)]
+    m = re.match(r"(\d{4})-(\d{2})-(\d{2})[T\s](\d{2}):(\d{2})", pub)
+    if m:
+        return f"{m.group(2)}-{m.group(3)} {m.group(4)}:{m.group(5)}"
+    return pub[:16]
 
 
 # ═══════════════════════════════════════════════════════════════
-#  频率词配置解析
+#  频率词配置解析（分类引擎，保持稳定）
 # ═══════════════════════════════════════════════════════════════
 
 class WordEntry:
-    """单个关键词条目，支持普通子串匹配与正则匹配。"""
+    """单个关键词条目，支持普通子串匹配与 /正则/ 匹配。"""
 
     def __init__(self, raw: str):
         self.display_name: Optional[str] = None
-        self.is_regex: bool = False
+        self.is_regex = False
         self.pattern: Optional[re.Pattern] = None
-        self.word: str = raw.strip()
+        self.word = raw.strip()
 
-        # 拆分 "=> 别名"
         if "=>" in self.word:
             parts = re.split(r"\s*=>\s*", self.word, 1)
             self.word = parts[0].strip()
             if len(parts) > 1 and parts[1].strip():
                 self.display_name = parts[1].strip()
 
-        # 判断是否为正则表达式 /pattern/flags
         regex_m = re.match(r"^/(.+)/([a-z]*)$", self.word)
         if regex_m:
             pattern_str = regex_m.group(1)
@@ -170,72 +212,44 @@ class WordEntry:
                 self.is_regex = True
                 self.word = pattern_str
             except re.error:
-                # 正则编译失败则退化为普通字符串
                 self.is_regex = False
 
     def matches(self, title_lower: str) -> bool:
-        """判断该关键词是否在标题中匹配（标题已转为小写）。"""
         if self.is_regex and self.pattern:
             return bool(self.pattern.search(title_lower))
         return self.word.lower() in title_lower
 
 
 class WordGroup:
-    """一组关键词，包含必须词、普通词、过滤词、组别名与最大条数。"""
+    """一组关键词：必须词(+)、普通词、过滤词(!)、组别名、最大条数(@)。"""
 
     def __init__(self) -> None:
         self.required: List[WordEntry] = []
         self.normal: List[WordEntry] = []
         self.filters: List[WordEntry] = []
         self.alias: Optional[str] = None
-        self.max_count: int = 0
+        self.max_count = 0
 
     @property
     def display_name(self) -> str:
-        """生成组的显示名称。"""
         if self.alias:
             return self.alias
-        parts: List[str] = []
-        for w in self.normal + self.required:
-            parts.append(w.display_name or w.word)
+        parts = [w.display_name or w.word for w in self.normal + self.required]
         return " / ".join(parts) if parts else "未命名分组"
 
     def matches(self, title_lower: str) -> bool:
-        """
-        判断标题是否匹配本组。
-
-        规则：
-        1. 如果有过滤词命中则不匹配
-        2. 如果有必须词，所有必须词都要匹配
-        3. 如果有普通词，任意一个匹配即可
-        4. 两者皆无则不匹配
-        """
-        # 过滤词检查
         for f in self.filters:
             if f.matches(title_lower):
                 return False
-        # 必须词检查
-        if self.required:
-            if not all(r.matches(title_lower) for r in self.required):
-                return False
-        # 普通词检查
-        if self.normal:
-            if not any(n.matches(title_lower) for n in self.normal):
-                return False
-        # 至少需要一种词
+        if self.required and not all(r.matches(title_lower) for r in self.required):
+            return False
+        if self.normal and not any(n.matches(title_lower) for n in self.normal):
+            return False
         return bool(self.required or self.normal)
 
 
 def parse_frequency_words(file_path: Path) -> Tuple[List[WordGroup], List[str]]:
-    """
-    解析 frequency_words.txt 文件。
-
-    Args:
-        file_path: 配置文件路径
-
-    Returns:
-        (词组列表, 全局过滤词列表)
-    """
+    """解析 frequency_words.txt → (词组列表, 全局过滤词列表)。"""
     if not file_path.exists():
         print(f"  [警告] 频率词配置文件不存在: {file_path}")
         return [], []
@@ -243,43 +257,34 @@ def parse_frequency_words(file_path: Path) -> Tuple[List[WordGroup], List[str]]:
     with open(file_path, "r", encoding="utf-8") as f:
         content = f.read()
 
-    # 按空行分割为段落
     paragraphs = re.split(r"\n\s*\n", content)
-
     groups: List[WordGroup] = []
     global_filters: List[str] = []
     current_section = "WORD_GROUPS"
 
     for para in paragraphs:
-        # 去除注释行和空行
         lines: List[str] = []
         for line in para.split("\n"):
             stripped = line.strip()
             if stripped and not stripped.startswith("#"):
                 lines.append(stripped)
-
         if not lines:
             continue
 
-        # 检查区域标记
         if lines[0].startswith("[") and lines[0].endswith("]"):
             section_name = lines[0][1:-1].strip().upper()
             if section_name in ("GLOBAL_FILTER", "WORD_GROUPS"):
                 current_section = section_name
                 lines = lines[1:]
 
-        # 全局过滤区
         if current_section == "GLOBAL_FILTER":
             for line in lines:
-                # 跳过特殊语法行
                 if line.startswith(("!", "+", "@", "[")):
                     continue
                 global_filters.append(line)
             continue
 
-        # 词组区
         group = WordGroup()
-        # 检查第一行是否为组别名
         if lines and lines[0].startswith("[") and lines[0].endswith("]"):
             potential = lines[0][1:-1].strip()
             if potential.upper() not in ("GLOBAL_FILTER", "WORD_GROUPS"):
@@ -288,7 +293,6 @@ def parse_frequency_words(file_path: Path) -> Tuple[List[WordGroup], List[str]]:
 
         for line in lines:
             if line.startswith("@"):
-                # 最大条数限制
                 try:
                     count = int(line[1:])
                     if count > 0:
@@ -308,37 +312,18 @@ def parse_frequency_words(file_path: Path) -> Tuple[List[WordGroup], List[str]]:
     return groups, global_filters
 
 
-def categorize_title(
-    title: str,
-    groups: List[WordGroup],
-    global_filters: List[str],
-) -> Optional[str]:
-    """
-    将标题分类到第一个匹配的词组。
-
-    Args:
-        title: 新闻标题
-        groups: 词组列表
-        global_filters: 全局过滤词
-
-    Returns:
-        匹配到的分类名称，若被全局过滤则返回 None，未匹配返回 "未分类"
-    """
+def categorize_title(title: str, groups: List[WordGroup],
+                     global_filters: List[str]) -> Optional[str]:
+    """标题 → 第一个匹配的词组名；全局过滤命中返回 None；未匹配返回 '未分类'。"""
     if not isinstance(title, str) or not title.strip():
         return None
-
     title_lower = title.lower()
-
-    # 全局过滤检查
     for gw in global_filters:
         if gw.lower() in title_lower:
             return None
-
-    # 按顺序匹配词组
     for group in groups:
         if group.matches(title_lower):
             return group.display_name
-
     return "未分类"
 
 
@@ -351,7 +336,9 @@ def load_news_db(db_path: Path) -> Tuple[List[Dict[str, Any]], Dict[str, str], O
     读取热榜新闻数据库。
 
     Returns:
-        (新闻列表, 平台ID→名称映射, 最新抓取时间 HH-MM)
+        (新闻列表, 平台ID→名称映射, 最新抓取批次时间)
+        新闻字段：id/title/platform_id/rank/url/first_crawl_time/last_crawl_time/
+                 crawl_count/ranks(list)/rank_timeline(list[(HH:MM, rank)])
     """
     if not db_path.exists():
         print(f"  [警告] 新闻数据库不存在: {db_path}")
@@ -361,7 +348,6 @@ def load_news_db(db_path: Path) -> Tuple[List[Dict[str, Any]], Dict[str, str], O
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
     try:
-        # 读取平台映射
         platform_map: Dict[str, str] = {}
         try:
             for row in conn.execute("SELECT id, name FROM platforms"):
@@ -369,7 +355,6 @@ def load_news_db(db_path: Path) -> Tuple[List[Dict[str, Any]], Dict[str, str], O
         except sqlite3.OperationalError:
             pass
 
-        # 读取新闻条目
         news_items: List[Dict[str, Any]] = []
         try:
             for row in conn.execute(
@@ -386,11 +371,30 @@ def load_news_db(db_path: Path) -> Tuple[List[Dict[str, Any]], Dict[str, str], O
                     "first_crawl_time": row["first_crawl_time"],
                     "last_crawl_time": row["last_crawl_time"],
                     "crawl_count": row["crawl_count"] or 1,
+                    "ranks": [],
+                    "rank_timeline": [],
                 })
         except sqlite3.OperationalError as e:
             print(f"  [警告] 读取 news_items 失败: {e}")
 
-        # 读取最新抓取时间
+        # 排名轨迹（rank_history）
+        try:
+            timeline: Dict[int, List[Tuple[str, int]]] = {}
+            for row in conn.execute(
+                "SELECT news_item_id, rank, crawl_time FROM rank_history ORDER BY id"
+            ):
+                timeline.setdefault(row["news_item_id"], []).append(
+                    (row["crawl_time"], row["rank"] if row["rank"] is not None else 0)
+                )
+            for item in news_items:
+                tl = timeline.get(item["id"], [])
+                item["rank_timeline"] = [
+                    (format_hhmm(t), r) for t, r in tl
+                ]
+                item["ranks"] = [r for _, r in tl]
+        except sqlite3.OperationalError:
+            pass
+
         latest_crawl: Optional[str] = None
         try:
             row = conn.execute(
@@ -408,12 +412,7 @@ def load_news_db(db_path: Path) -> Tuple[List[Dict[str, Any]], Dict[str, str], O
 
 
 def load_rss_db(db_path: Path) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
-    """
-    读取 RSS 数据库。
-
-    Returns:
-        (RSS条目列表, 源ID→名称映射)
-    """
+    """读取 RSS 数据库 → (RSS条目列表, 源ID→名称映射)。"""
     if not db_path.exists():
         print(f"  [提示] RSS 数据库不存在: {db_path}（继续执行）")
         return [], {}
@@ -422,7 +421,6 @@ def load_rss_db(db_path: Path) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
     try:
-        # 读取 RSS 源映射
         feed_map: Dict[str, str] = {}
         try:
             for row in conn.execute("SELECT id, name FROM rss_feeds"):
@@ -430,7 +428,6 @@ def load_rss_db(db_path: Path) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
         except sqlite3.OperationalError:
             pass
 
-        # 读取 RSS 条目
         rss_items: List[Dict[str, Any]] = []
         try:
             for row in conn.execute(
@@ -455,153 +452,228 @@ def load_rss_db(db_path: Path) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
         conn.close()
 
 
+def find_latest_db(data_dir: Path, prefix: str) -> Optional[Path]:
+    """目录中最新的 YYYY-MM-DD.db 文件（按文件名降序）。"""
+    if not data_dir.exists():
+        return None
+    dbs = sorted(data_dir.glob(f"{prefix}*.db"), reverse=True)
+    return dbs[0] if dbs else None
+
+
 # ═══════════════════════════════════════════════════════════════
-#  AI 分析提取
+#  AI 分析提取（从 TrendRadar 生成的 index.html）
 # ═══════════════════════════════════════════════════════════════
 
-class _AISectionExtractor(HTMLParser):
+class _AIBlockParser(HTMLParser):
     """
-    从 HTML 中提取 class 或 id 包含 "ai" 的区域。
+    提取 TrendRadar 报告中的 AI 分析板块。
 
-    使用 HTMLParser 跟踪标签嵌套，准确提取整个 AI 分析区块的 HTML。
+    目标结构（见 trendradar/ai/formatter.py render_ai_analysis_html_rich）：
+        <div class="ai-section">
+          <div class="ai-section-header">...<div class="ai-section-title">✨ AI 热点分析</div>
+          <div class="ai-blocks-grid">
+            <div class="ai-block">
+              <div class="ai-block-title">核心热点态势</div>
+              <div class="ai-block-content">正文（<br> 换行）</div>
+            </div>
+            ...
+          </div>
+        </div>
+    失败/跳过时为 <div class="ai-warning"> / <div class="ai-info">。
     """
 
     def __init__(self) -> None:
         super().__init__()
-        self._recording = False
-        self._depth = 0
-        self._parts: List[str] = []
-        self._found_tag: Optional[str] = None
-
-    def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
-        attrs_dict = dict(attrs)
-        class_attr = (attrs_dict.get("class") or "").lower()
-        id_attr = (attrs_dict.get("id") or "").lower()
-
-        # 检测 AI 区域的起始标签
-        if not self._recording:
-            is_ai = (
-                "ai-section" in class_attr
-                or "ai_analysis" in class_attr
-                or "ai-analysis" in class_attr
-                or id_attr.startswith("ai")
-                or "ai-analysis" in id_attr
-                or "ai_analysis" in id_attr
-            )
-            if is_ai:
-                self._recording = True
-                self._depth = 1
-                self._found_tag = tag
-                self._parts.append(self._render_open_tag(tag, attrs))
-                return
-
-        if self._recording:
-            # 自关闭标签不增加深度
-            if tag not in ("br", "hr", "img", "input", "meta", "link"):
-                self._depth += 1
-            self._parts.append(self._render_open_tag(tag, attrs))
-
-    def handle_endtag(self, tag: str) -> None:
-        if self._recording:
-            self._parts.append(f"</{tag}>")
-            # 对所有结束标签减少深度（与开始标签的深度递增配对）
-            self._depth -= 1
-            if self._depth <= 0:
-                self._recording = False
-
-    def handle_data(self, data: str) -> None:
-        if self._recording:
-            self._parts.append(data)
-
-    def handle_startendtag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
-        if self._recording:
-            self._parts.append(self._render_open_tag(tag, attrs, self_closing=True))
-
-    def handle_entityref(self, name: str) -> None:
-        if self._recording:
-            self._parts.append(f"&{name};")
-
-    def handle_charref(self, name: str) -> None:
-        if self._recording:
-            self._parts.append(f"&#{name};")
+        self.blocks: List[Dict[str, str]] = []
+        self.message: str = ""
+        self._stack: List[str] = []          # 角色栈：section/block/title/content/message
+        self._title_buf: List[str] = []
+        self._content_buf: List[str] = []
+        self._message_buf: List[str] = []
 
     @staticmethod
-    def _render_open_tag(
-        tag: str,
-        attrs: List[Tuple[str, Optional[str]]],
-        self_closing: bool = False,
-    ) -> str:
-        """重新渲染开始标签。"""
-        attr_str = ""
+    def _role(attrs: List[Tuple[str, Optional[str]]]) -> Optional[str]:
+        tokens: set = set()
         for name, value in attrs:
-            if value is None:
-                attr_str += f" {name}"
-            else:
-                attr_str += f' {name}="{html_escape(value, quote=True)}"'
-        if self_closing:
-            return f"<{tag}{attr_str} />"
-        return f"<{tag}{attr_str}>"
+            if name == "class" and value:
+                tokens = set(value.lower().split())
+                break
+        # 按 class 词元精确匹配：避免 ai-blocks-grid 误命中 ai-block、
+        # ai-section-header/title/badge 误命中 ai-section
+        if "ai-block-title" in tokens:
+            return "title"
+        if "ai-block-content" in tokens:
+            return "content"
+        if "ai-block" in tokens:
+            return "block"
+        if tokens & {"ai-warning", "ai-error", "ai-info"}:
+            return "message"
+        if "ai-section" in tokens:
+            return "section"
+        return None
 
-    def get_result(self) -> str:
-        """获取提取到的 AI 区域 HTML。"""
-        return "".join(self._parts).strip()
+    def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
+        if tag == "div":
+            # 每个 div 都入栈（role=None 的装饰元素也入栈），
+            # 保证开闭一一配对，角色栈不会因嵌套装饰 div 而错位
+            role = self._role(attrs)
+            self._stack.append(role)
+            if role == "block":
+                self._title_buf = []
+                self._content_buf = []
+            elif role == "message":
+                self._message_buf = []
+        elif tag == "br" and self._stack and self._stack[-1] == "content":
+            self._content_buf.append("\n")
+
+    def handle_startendtag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
+        if tag == "br" and self._stack and self._stack[-1] == "content":
+            self._content_buf.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag != "div" or not self._stack:
+            return
+        role = self._stack.pop()
+        if role == "block":
+            title = "".join(self._title_buf).strip()
+            content = "".join(self._content_buf).strip()
+            if title:
+                self.blocks.append({"title": title, "content": content})
+        elif role == "message":
+            msg = "".join(self._message_buf).strip()
+            if msg and not self.message:
+                self.message = msg
+
+    def handle_data(self, data: str) -> None:
+        if not self._stack:
+            return
+        top = self._stack[-1]
+        if top == "title":
+            self._title_buf.append(data)
+        elif top == "content":
+            self._content_buf.append(data)
+        elif top == "message":
+            self._message_buf.append(data)
 
 
-def extract_ai_analysis(html_path: Path) -> str:
+def extract_ai_blocks(html_path: Path) -> List[Dict[str, str]]:
     """
-    从 TrendRadar 生成的 index.html 中提取 AI 分析区域的 HTML。
-
-    Args:
-        html_path: index.html 文件路径
+    从 TrendRadar 生成的 index.html 提取 AI 分析板块。
 
     Returns:
-        AI 分析区域的 HTML 字符串，若未找到则返回空字符串
+        [{"title": 板块名, "content": 纯文本正文}, ...]；失败/无内容返回 []。
+        若 AI 区域存在但为警告/提示信息，返回 [{"title": "", "content": 提示}]。
     """
     if not html_path.exists():
         print(f"  [提示] 未找到 TrendRadar 报告: {html_path}")
-        return ""
+        return []
 
     try:
         with open(html_path, "r", encoding="utf-8") as f:
             content = f.read()
     except OSError as e:
         print(f"  [警告] 读取 index.html 失败: {e}")
-        return ""
+        return []
 
-    parser = _AISectionExtractor()
+    parser = _AIBlockParser()
     try:
         parser.feed(content)
-    except Exception as e:
+    except Exception as e:  # 解析器容错
         print(f"  [警告] 解析 index.html 时出错: {e}")
-        return ""
+        return []
 
-    result = parser.get_result()
-    if result:
-        print("  已从 index.html 提取 AI 分析内容")
-    else:
-        print("  未在 index.html 中找到 AI 分析区域")
-    return result
+    if parser.blocks:
+        names = "、".join(b["title"] for b in parser.blocks)
+        print(f"  已提取 AI 分析 {len(parser.blocks)} 个板块：{names}")
+        return parser.blocks
+
+    if parser.message:
+        print(f"  AI 分析区域存在但不可用：{parser.message[:60]}")
+        return [{"title": "", "content": parser.message}]
+
+    print("  未在 index.html 中找到 AI 分析区域")
+    return []
+
+
+def split_bullets(text: str, max_len: int = 120) -> List[str]:
+    """
+    将 AI 板块长文本切分为短要点。
+
+    切分规则：
+        - 换行符切分
+        - 行内序号 "1." "2、" 前断开
+        - 中文句读 "。；！？" 后断开（过短片段保留不切）
+        - 去掉 "• - * · ○ ▪" 等项目符号与序号前缀
+        - 【标签】扁平化为 "标签：" 前缀
+    """
+    if not text:
+        return []
+    text = html_lib.unescape(text)
+
+    # 行内序号前换行（排除小数/版本号，如 2.0）
+    text = re.sub(r"(?<=[^\d.\n])\s*(\d{1,2})[.、]\s*", r"\n\1. ", text)
+    # 句读标点后换行
+    text = re.sub(r"([。；！？])\s*", r"\1\n", text)
+
+    bullets: List[str] = []
+    seen = set()
+    for raw in text.split("\n"):
+        s = raw.strip()
+        if not s:
+            continue
+        # 去项目符号（• · - * ▪ 等）
+        s = re.sub(r"^[·•▪◦※*\-–—]+\s*", "", s)
+        # 去序号前缀
+        s = re.sub(r"^\d{1,2}[.、]\s*", "", s)
+        # 扁平化 【标签】： → 标签：
+        s = re.sub(r"【([^】]+)】\s*[:：]?", r"\1：", s)
+        s = s.strip("：: \t")
+        # 去掉分句残留的末尾分号/逗号/顿号
+        s = s.rstrip("；;，,、 \t")
+        if len(s) < 4:
+            continue
+        if len(s) > max_len:
+            s = s[:max_len].rstrip() + "…"
+        if s in seen:
+            continue
+        seen.add(s)
+        bullets.append(s)
+    return bullets
+
+
+def style_ai_block(title: str) -> Dict[str, Any]:
+    """根据板块标题匹配颜色/图标/是否高亮。"""
+    low = title.lower()
+    for keywords, key, color, icon, wide in AI_BLOCK_STYLES:
+        if any(kw.lower() in low for kw in keywords):
+            return {"key": key, "color": color, "icon": icon, "wide": wide}
+    key, color, icon, wide = AI_BLOCK_DEFAULT
+    return {"key": key, "color": color, "icon": icon, "wide": wide}
 
 
 # ═══════════════════════════════════════════════════════════════
-#  数据处理与热度计算
+#  数据处理
 # ═══════════════════════════════════════════════════════════════
 
 def calc_news_weight(rank: int, crawl_count: int) -> float:
-    """
-    计算新闻热度权重。
-
-    公式：
-        weight = (50 - min(rank, 50)) * 0.6
-               + crawl_count * 3 * 0.3
-               + (1 if rank <= 5 else 0) * 10 * 0.1
-
-    排名越靠前（rank 越小）权重越高，在榜时间越长（crawl_count 越大）权重越高。
-    """
+    """热度权重：排名越靠前越高、在榜越久越高。"""
     rank_score = (50 - min(rank, 50)) * 0.6
     crawl_score = crawl_count * 3 * 0.3
     top_bonus = 10 * 0.1 if rank <= 5 else 0
     return round(rank_score + crawl_score + top_bonus, 2)
+
+
+def _trend_strings(item: Dict[str, Any]) -> Tuple[str, str]:
+    """由排名轨迹生成 (紧凑趋势 '24→18', 悬浮提示 '00:47 #24 · ...')。"""
+    tl = item.get("rank_timeline") or []
+    ranks = [r for _, r in tl if r and r > 0]
+    if not ranks:
+        return "", ""
+    first, last = ranks[0], ranks[-1]
+    compact = f"{first}→{last}" if first != last else f"{first}"
+    tip_points = [f"{t} #{r}" for t, r in tl if r and r > 0][-8:]
+    tip = " · ".join(tip_points)
+    return compact, tip
 
 
 def process_news(
@@ -611,12 +683,7 @@ def process_news(
     global_filters: List[str],
     latest_crawl: Optional[str],
 ) -> Dict[str, Any]:
-    """
-    对新闻数据进行分类、排序与统计。
-
-    Returns:
-        包含分类新闻、统计数据、图表数据的字典
-    """
+    """分类、排序、统计热榜新闻。"""
     categorized: Dict[str, List[Dict[str, Any]]] = {}
     platform_counts: Dict[str, int] = {}
     all_news: List[Dict[str, Any]] = []
@@ -624,462 +691,415 @@ def process_news(
     hit_count = 0
 
     for item in news_items:
-        title = item["title"]
-        category = categorize_title(title, groups, global_filters)
-
-        # 被全局过滤的新闻跳过
+        category = categorize_title(item["title"], groups, global_filters)
         if category is None:
             continue
 
-        # 平台名称
         platform_name = platform_map.get(item["platform_id"], item["platform_id"])
-
-        # 计算热度权重
         weight = calc_news_weight(item["rank"], item["crawl_count"])
+        trend, trend_tip = _trend_strings(item)
 
-        processed = {
-            **item,
-            "platform_name": platform_name,
-            "category": category,
-            "weight": weight,
-            "time_display": format_hhmm(item["last_crawl_time"]),
-        }
-        all_news.append(processed)
-
-        # 分类计数
-        categorized.setdefault(category, []).append(processed)
-
-        # 平台计数
-        platform_counts[platform_name] = platform_counts.get(platform_name, 0) + 1
-
-        # 命中分类数（排除"未分类"）
-        if category != "未分类":
-            hit_count += 1
-
-        # 新增热点：crawl_count == 1 或首次抓取时间为最新抓取批次
         is_new = item["crawl_count"] == 1
         if latest_crawl and item.get("first_crawl_time") == latest_crawl:
             is_new = True
         if is_new:
             new_count += 1
 
-    # 每个分类内按权重降序排列
+        processed = {
+            "id": item["id"],
+            "title": item["title"],
+            "platform_id": item["platform_id"],
+            "platform_name": platform_name,
+            "rank": item["rank"],
+            "url": item["url"],
+            "crawl_count": item["crawl_count"],
+            "time_display": format_hhmm(item["last_crawl_time"]),
+            "first_display": format_hhmm(item["first_crawl_time"]),
+            "is_new": is_new,
+            "weight": weight,
+            "category": category,
+            "trend": trend,
+            "trend_tip": trend_tip,
+        }
+        all_news.append(processed)
+        categorized.setdefault(category, []).append(processed)
+        platform_counts[platform_name] = platform_counts.get(platform_name, 0) + 1
+        if category != "未分类":
+            hit_count += 1
+
     for cat in categorized:
         categorized[cat].sort(key=lambda x: x["weight"], reverse=True)
 
-    # 按分类新闻数量降序排列分类
-    sorted_categories = sorted(
-        categorized.items(), key=lambda x: len(x[1]), reverse=True
-    )
-
-    # 平台分布（Top 10）
-    sorted_platforms = sorted(
-        platform_counts.items(), key=lambda x: x[1], reverse=True
-    )
-
-    # 热度排行（Top 10）
-    hottest = sorted(all_news, key=lambda x: x["weight"], reverse=True)[:10]
+    sorted_categories = sorted(categorized.items(), key=lambda x: len(x[1]), reverse=True)
+    sorted_platforms = sorted(platform_counts.items(), key=lambda x: x[1], reverse=True)
 
     return {
         "all_news": all_news,
         "categorized": dict(sorted_categories),
         "platform_counts": platform_counts,
         "sorted_platforms": sorted_platforms,
-        "hottest": hottest,
         "total": len(all_news),
         "hit_count": hit_count,
         "new_count": new_count,
     }
 
 
-def process_rss(
-    rss_items: List[Dict[str, Any]],
-    feed_map: Dict[str, str],
-) -> Dict[str, List[Dict[str, Any]]]:
-    """
-    将 RSS 条目按订阅源分组。
-
-    Returns:
-        源名称 → 条目列表 的有序字典（按条目数降序）
-    """
+def process_rss(rss_items: List[Dict[str, Any]],
+                feed_map: Dict[str, str]) -> List[Dict[str, Any]]:
+    """RSS 按订阅源分组 → [{name, items:[...]}]（按条数降序）。"""
     grouped: Dict[str, List[Dict[str, Any]]] = {}
     for item in rss_items:
-        feed_name = feed_map.get(item["feed_id"], item["feed_id"])
-        item["feed_name"] = feed_name
-        # 格式化发布时间
-        pub = item.get("published_at", "")
-        if pub:
-            # 尝试提取 YYYY-MM-DD HH:MM
-            m = re.match(r"(\d{4}-\d{2}-\d{2})[T\s](\d{2}:\d{2})", pub)
-            if m:
-                item["published_display"] = f"{m.group(1)} {m.group(2)}"
-            else:
-                item["published_display"] = pub[:16]
-        else:
-            item["published_display"] = ""
-        grouped.setdefault(feed_name, []).append(item)
-
-    # 按条目数降序排列
-    return dict(sorted(grouped.items(), key=lambda x: len(x[1]), reverse=True))
-
-
-# ═══════════════════════════════════════════════════════════════
-#  历史报告管理
-# ═══════════════════════════════════════════════════════════════
-
-def scan_history_reports() -> List[Dict[str, str]]:
-    """
-    扫描 _site/reports/ 目录，构建历史报告列表。
-
-    Returns:
-        历史报告列表，每项包含 filename, date_label, path，按日期降序排列
-    """
-    reports: List[Dict[str, str]] = []
-    if not REPORTS_DIR.exists():
-        return reports
-
-    for f in REPORTS_DIR.glob("*.html"):
-        # 从文件名解析日期 YYYY-MM-DD-HHMM.html
-        m = re.match(r"(\d{4}-\d{2}-\d{2})-(\d{2})(\d{2})", f.stem)
-        if m:
-            date_label = f"{m.group(1)} {m.group(2)}:{m.group(3)}"
-        else:
-            date_label = f.stem
-        reports.append({
-            "filename": f.name,
-            "date_label": date_label,
-            "path": f"reports/{f.name}",
+        feed_name = feed_map.get(item["feed_id"], item["feed_id"]) or "未知来源"
+        summary = re.sub(r"<[^>]+>", "", item.get("summary", "") or "").strip()
+        if len(summary) > 100:
+            summary = summary[:100] + "…"
+        grouped.setdefault(feed_name, []).append({
+            # 压缩键名，与前端 newsRowHTML 的 RSS 分支对齐
+            "t": item["title"],
+            "u": item["url"],
+            "f": feed_name,
+            "pub": format_pub_time(item.get("published_at", "")),
+            "summary": summary,
         })
 
-    reports.sort(key=lambda x: x["filename"], reverse=True)
-    return reports
+    groups_out = [
+        {"name": name, "items": items}
+        for name, items in sorted(grouped.items(), key=lambda x: len(x[1]), reverse=True)
+    ]
+    return groups_out
+
+
+# ═══════════════════════════════════════════════════════════════
+#  销售视图构建
+# ═══════════════════════════════════════════════════════════════
+
+def _cat_matches(cat_name: str, kws: List[str], regex: Optional[re.Pattern]) -> bool:
+    low = cat_name.lower()
+    if any(kw.lower() in low for kw in kws):
+        return True
+    if regex and regex.search(low):
+        return True
+    return False
+
+
+def _title_matches(title_lower: str, kws: List[str],
+                   regex: Optional[re.Pattern]) -> bool:
+    if any(kw.lower() in title_lower for kw in kws):
+        return True
+    if regex and regex.search(title_lower):
+        return True
+    return False
+
+
+def _compact_news_item(it: Dict[str, Any]) -> Dict[str, Any]:
+    """压缩新闻条目为前端 JSON 字段。"""
+    return {
+        "i": it["id"],
+        "t": it["title"],
+        "p": it["platform_name"],
+        "r": it["rank"],
+        "u": it["url"],
+        "l": it["time_display"],
+        "c": it["crawl_count"],
+        "n": it["is_new"],
+        "w": it["weight"],
+        "tr": it["trend"],
+        "tt": it["trend_tip"],
+    }
+
+
+def build_sales_views(news_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    按销售优先级构建导航视图。
+
+    顺序：商机信号 → 科华动态 → 股份制银行 → UPS与电源 → 数据中心 →
+          AI与大模型 → 友商动态(6 个子品牌) → （行业资讯/总榜由外部追加）→
+          其他有新闻的分类
+    """
+    categorized: Dict[str, List[Dict[str, Any]]] = news_data["categorized"]
+    all_news: List[Dict[str, Any]] = news_data["all_news"]
+
+    # 初始化固定视图
+    views: Dict[str, Dict[str, Any]] = {}
+    for v in FIXED_VIEWS:
+        views[v["id"]] = {
+            "id": v["id"], "label": v["label"], "icon": v["icon"],
+            "type": "news", "items": [],
+        }
+    comp_views: Dict[str, Dict[str, Any]] = {}
+    for cid, label, _kws in COMPETITORS:
+        comp_views[cid] = {"id": cid, "label": label, "icon": "🏷️",
+                           "type": "news", "items": []}
+
+    claimed_cats: set = set()
+
+    # 1) 按分类名认领
+    for cat, items in categorized.items():
+        cat_low = cat.lower()
+        matched = False
+        for v in FIXED_VIEWS:
+            if _cat_matches(cat_low, v["cat_kw"], v.get("cat_re")):
+                views[v["id"]]["items"].extend(items)
+                claimed_cats.add(cat)
+                matched = True
+                break
+        if matched:
+            continue
+        for cid, label, kws in COMPETITORS:
+            if label in cat or any(kw in cat_low for kw in kws):
+                comp_views[cid]["items"].extend(items)
+                claimed_cats.add(cat)
+                break
+
+    # 2) 按标题关键词补充抓取（去重）
+    def add_if_absent(bucket: List[Dict[str, Any]], item: Dict[str, Any],
+                      seen: set) -> None:
+        if item["id"] not in seen:
+            seen.add(item["id"])
+            bucket.append(item)
+
+    for v in FIXED_VIEWS:
+        seen = {it["id"] for it in views[v["id"]]["items"]}
+        for it in all_news:
+            if _title_matches(it["title"].lower(), v["title_kw"], v.get("title_re")):
+                add_if_absent(views[v["id"]]["items"], it, seen)
+
+    for cid, label, kws in COMPETITORS:
+        seen = {it["id"] for it in comp_views[cid]["items"]}
+        for it in all_news:
+            if _title_matches(it["title"].lower(), kws, None):
+                add_if_absent(comp_views[cid]["items"], it, seen)
+
+    # 3) 视图内排序
+    for v in views.values():
+        v["items"].sort(key=lambda x: x["weight"], reverse=True)
+    for v in comp_views.values():
+        v["items"].sort(key=lambda x: x["weight"], reverse=True)
+
+    # 4) 商机信号 = 科华/银行/UPS/IDC + 友商 的并集
+    signal_ids: set = set()
+    signal_items: List[Dict[str, Any]] = []
+    for vid in ("kehua", "banks", "ups", "idc"):
+        for it in views[vid]["items"]:
+            if it["id"] not in signal_ids:
+                signal_ids.add(it["id"])
+                signal_items.append(it)
+    for v in comp_views.values():
+        for it in v["items"]:
+            if it["id"] not in signal_ids:
+                signal_ids.add(it["id"])
+                signal_items.append(it)
+    signal_items.sort(key=lambda x: x["weight"], reverse=True)
+
+    # 5) 按优先级组装（空视图不输出）
+    ordered: List[Dict[str, Any]] = []
+    if signal_items:
+        ordered.append({
+            "id": "signals", "label": "商机信号", "icon": "🔴",
+            "type": "news",
+            "items": [_compact_news_item(it) for it in signal_items],
+        })
+    for v in FIXED_VIEWS:
+        bucket = views[v["id"]]
+        if bucket["items"]:
+            ordered.append({
+                "id": bucket["id"], "label": bucket["label"],
+                "icon": bucket["icon"], "type": "news",
+                "items": [_compact_news_item(it) for it in bucket["items"]],
+            })
+
+    comp_children = [
+        {
+            "id": cid, "label": label, "icon": "🏷️", "type": "news",
+            "items": [_compact_news_item(it) for it in comp_views[cid]["items"]],
+        }
+        for cid, label, _kws in COMPETITORS if comp_views[cid]["items"]
+    ]
+    if comp_children:
+        total_comp = sum(len(c["items"]) for c in comp_children)
+        ordered.append({
+            "id": "competitors", "label": "友商动态", "icon": "🔧",
+            "type": "group", "count": total_comp, "children": comp_children,
+        })
+
+    # 6) 其他未被认领的分类（按条数降序）
+    other_idx = 0
+    for cat, items in categorized.items():
+        if cat in claimed_cats:
+            continue
+        other_idx += 1
+        ordered.append({
+            "id": f"other-{other_idx}", "label": cat, "icon": "📂",
+            "type": "news",
+            "items": [_compact_news_item(it) for it in items],
+        })
+
+    return ordered
+
+
+def build_hotlist(news_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """总榜：按平台分组，组内按排名升序。"""
+    platform_news: Dict[str, List[Dict[str, Any]]] = {}
+    for item in news_data["all_news"]:
+        platform_news.setdefault(item["platform_name"], []).append(item)
+
+    result = []
+    for pname in sorted(platform_news.keys(),
+                        key=lambda p: len(platform_news[p]), reverse=True):
+        items = sorted(platform_news[pname], key=lambda x: x["rank"])
+        result.append({
+            "n": pname,
+            "items": [_compact_news_item(it) for it in items],
+        })
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════
+#  历史报告
+# ═══════════════════════════════════════════════════════════════
+
+def _scan_dir(d: Path) -> Dict[str, Dict[str, str]]:
+    """扫描目录下 YYYY-MM-DD-HHMM.html → {filename: {file, label}}。"""
+    found: Dict[str, Dict[str, str]] = {}
+    if not d.exists():
+        return found
+    for f in d.glob("*.html"):
+        m = re.match(r"(\d{4}-\d{2}-\d{2})-(\d{2})(\d{2})", f.stem)
+        label = f"{m.group(1)} {m.group(2)}:{m.group(3)}" if m else f.stem
+        found[f.name] = {"file": f.name, "label": label}
+    return found
+
+
+def scan_history_reports() -> List[Dict[str, str]]:
+    """扫描 _site/reports/ 与 reports/ 两个目录，合并去重（按文件名降序）。"""
+    merged: Dict[str, Dict[str, str]] = {}
+    # git 持久化目录优先（历史更全），站点目录补充
+    merged.update(_scan_dir(REPORTS_GIT_DIR))
+    merged.update(_scan_dir(REPORTS_SITE_DIR))
+    reports = sorted(merged.values(), key=lambda r: r["file"], reverse=True)
+    return reports[:MAX_HISTORY_REPORTS]
 
 
 def cleanup_old_reports() -> None:
-    """删除超出数量限制的旧报告。"""
-    if not REPORTS_DIR.exists():
-        return
-    reports = sorted(REPORTS_DIR.glob("*.html"), reverse=True)
-    if len(reports) > MAX_HISTORY_REPORTS:
-        for old in reports[MAX_HISTORY_REPORTS:]:
+    """两个归档目录各自仅保留最新 MAX_HISTORY_REPORTS 份。"""
+    for d in (REPORTS_SITE_DIR, REPORTS_GIT_DIR):
+        if not d.exists():
+            continue
+        files = sorted(d.glob("*.html"), reverse=True)
+        for old in files[MAX_HISTORY_REPORTS:]:
             try:
                 old.unlink()
-                print(f"  已清理旧报告: {old.name}")
+                print(f"  已清理旧报告: {d.name}/{old.name}")
             except OSError:
                 pass
 
 
 # ═══════════════════════════════════════════════════════════════
-#  HTML 生成
+#  数据载荷
 # ═══════════════════════════════════════════════════════════════
 
-def _render_news_card(item: Dict[str, Any], index: int = 0) -> str:
-    """渲染单条新闻卡片 HTML。"""
-    rank = item.get("rank", 999)
-    title = html_escape(item.get("title", ""))
-    url = item.get("url", "")
-    platform_name = html_escape(item.get("platform_name", ""))
-    platform_id = item.get("platform_id", "")
-    time_disp = item.get("time_display", "--:--")
-    crawl_count = item.get("crawl_count", 1)
-    weight = item.get("weight", 0)
-
-    # 排名样式
-    if rank in MEDAL_COLORS:
-        rank_style = f'background:{MEDAL_COLORS[rank]};color:#fff;font-weight:700;'
-    else:
-        rank_style = "background:var(--rank-bg);color:var(--rank-text);"
-
-    # 平台标签颜色
-    tag_color = color_for_platform(platform_id)
-
-    # 标题链接
-    if url:
-        title_html = f'<a href="{html_escape(url, quote=True)}" target="_blank" rel="noopener noreferrer" class="news-title">{title}</a>'
-    else:
-        title_html = f'<span class="news-title">{title}</span>'
-
-    # 新增标记
-    new_badge = ""
-    if item.get("crawl_count") == 1:
-        new_badge = '<span class="badge-new">NEW</span>'
-
-    return f"""
-    <div class="news-card" data-weight="{weight}">
-      <div class="news-rank" style="{rank_style}">{rank}</div>
-      <div class="news-body">
-        <div class="news-title-row">{title_html}{new_badge}</div>
-        <div class="news-meta">
-          <span class="source-tag" style="background:{tag_color}20;color:{tag_color};border:1px solid {tag_color}40;">{platform_name}</span>
-          <span class="meta-time">{time_disp}</span>
-          <span class="meta-crawl">在榜 {crawl_count} 次</span>
-        </div>
-      </div>
-    </div>"""
-
-
-def _render_rss_card(item: Dict[str, Any]) -> str:
-    """渲染单条 RSS 资讯卡片 HTML。"""
-    title = html_escape(item.get("title", ""))
-    url = item.get("url", "")
-    feed_name = html_escape(item.get("feed_name", ""))
-    pub = item.get("published_display", "")
-    summary = html_escape(item.get("summary", ""))
-
-    if url:
-        title_html = f'<a href="{html_escape(url, quote=True)}" target="_blank" rel="noopener noreferrer" class="news-title">{title}</a>'
-    else:
-        title_html = f'<span class="news-title">{title}</span>'
-
-    summary_html = ""
-    if summary:
-        # 去除 HTML 标签并截断
-        clean = re.sub(r"<[^>]+>", "", summary)
-        if len(clean) > 120:
-            clean = clean[:120] + "..."
-        summary_html = f'<div class="rss-summary">{html_escape(clean)}</div>'
-
-    return f"""
-    <div class="news-card rss-card">
-      <div class="news-body">
-        <div class="news-title-row">{title_html}</div>
-        {summary_html}
-        <div class="news-meta">
-          <span class="source-tag" style="background:var(--accent)20;color:var(--accent);border:1px solid var(--accent)40;">{feed_name}</span>
-          <span class="meta-time">{pub}</span>
-        </div>
-      </div>
-    </div>"""
-
-
-def build_html(
+def build_payload(
     news_data: Dict[str, Any],
-    rss_grouped: Dict[str, List[Dict[str, Any]]],
-    ai_html: str,
-    history_reports: List[Dict[str, str]],
-    date_str: str,
-    time_str: str,
-    rel_prefix: str = "",
-) -> str:
-    """
-    生成完整的自包含 HTML 仪表盘。
+    rss_groups: List[Dict[str, Any]],
+    ai_blocks: List[Dict[str, str]],
+    history: List[Dict[str, str]],
+    target_date: str,
+    data_date: Optional[str],
+) -> Dict[str, Any]:
+    now = now_shanghai()
 
-    Args:
-        news_data: 处理后的新闻数据
-        rss_grouped: 按源分组的 RSS 数据
-        ai_html: AI 分析区域 HTML
-        history_reports: 历史报告列表
-        date_str: 报告日期
-        time_str: 报告时间
-        rel_prefix: 相对路径前缀（归档页面用 "../"）
-    """
-    categorized = news_data["categorized"]
-    total_news = news_data["total"]
-    total_rss = sum(len(v) for v in rss_grouped.values())
-    hit_count = news_data["hit_count"]
-    new_count = news_data["new_count"]
-
-    # ── 历史报告下拉选项 ──
-    history_options = f'<option value="">选择历史报告</option>'
-    for rep in history_reports[:60]:
-        history_options += (
-            f'<option value="{rel_prefix}{rep["path"]}">{rep["date_label"]}</option>'
-        )
-
-    # ── 摘要卡片 ──
-    summary_cards = f"""
-    <div class="summary-grid">
-      <div class="summary-card">
-        <div class="summary-icon" style="background:#1677ff20;color:#1677ff;">
-          <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><path d="M7 16l4-8 4 4 4-6"/></svg>
-        </div>
-        <div class="summary-info"><div class="summary-value">{total_news}</div><div class="summary-label">热榜新闻总数</div></div>
-      </div>
-      <div class="summary-card">
-        <div class="summary-icon" style="background:#52c41a20;color:#52c41a;">
-          <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 11a9 9 0 0 1 9 9"/><path d="M4 4a16 16 0 0 1 16 16"/><circle cx="5" cy="19" r="1"/></svg>
-        </div>
-        <div class="summary-info"><div class="summary-value">{total_rss}</div><div class="summary-label">RSS 资讯数</div></div>
-      </div>
-      <div class="summary-card">
-        <div class="summary-icon" style="background:#722ed120;color:#722ed1;">
-          <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg>
-        </div>
-        <div class="summary-info"><div class="summary-value">{hit_count}</div><div class="summary-label">分类命中数</div></div>
-      </div>
-      <div class="summary-card">
-        <div class="summary-icon" style="background:#fa8c1620;color:#fa8c16;">
-          <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
-        </div>
-        <div class="summary-info"><div class="summary-value">{new_count}</div><div class="summary-label">新增热点数</div></div>
-      </div>
-    </div>"""
-
-    # ── 分类导航 Pills ──
-    pills = ['<button class="pill active" data-target="sec-overview">概览</button>']
-    for idx, (cat, items) in enumerate(categorized.items()):
-        cat_id = f"cat-{idx}"
-        color = color_for_index(idx, CATEGORY_PALETTE)
-        pills.append(
-            f'<button class="pill" data-target="{cat_id}" '
-            f'style="--pill-color:{color};">'
-            f'{html_escape(cat)} <span class="pill-count">{len(items)}</span></button>'
-        )
-    if rss_grouped:
-        pills.append('<button class="pill" data-target="sec-rss" style="--pill-color:#52c41a;">RSS 资讯</button>')
-    pills.append('<button class="pill" data-target="sec-hotlist" style="--pill-color:#f5222d;">完整热榜</button>')
-    pills_html = "\n".join(pills)
-
-    # ── 分类新闻区域 ──
-    category_sections = []
-    chart_pie_data = []
-    for idx, (cat, items) in enumerate(categorized.items()):
-        cat_id = f"cat-{idx}"
-        color = color_for_index(idx, CATEGORY_PALETTE)
-        cards = "".join(_render_news_card(it, i) for i, it in enumerate(items[:50]))
-        more_count = max(0, len(items) - 50)
-        more_html = f'<div class="more-hint">还有 {more_count} 条未显示</div>' if more_count else ""
-
-        category_sections.append(f"""
-    <section id="{cat_id}" class="category-section" style="--cat-color:{color};">
-      <div class="category-header">
-        <div class="category-dot" style="background:{color};"></div>
-        <h2 class="category-title">{html_escape(cat)}</h2>
-        <span class="category-count">{len(items)}</span>
-      </div>
-      <div class="news-list">{cards}{more_html}</div>
-    </section>""")
-
-        # 饼图数据（前 8 个分类）
-        chart_pie_data.append({"name": cat, "value": len(items)})
-
-    categories_html = "\n".join(category_sections)
-
-    # ── 饼图：前 8 个分类，其余合并为"其他" ──
-    if len(chart_pie_data) > 8:
-        top8 = chart_pie_data[:8]
-        others_value = sum(d["value"] for d in chart_pie_data[8:])
-        top8.append({"name": "其他", "value": others_value})
-        chart_pie_data = top8
-
-    # ── 平台柱状图数据（Top 10） ──
-    platform_bar_data = news_data["sorted_platforms"][:10]
-
-    # ── 热度排行数据（Top 10） ──
-    hottest_data = []
-    for it in news_data["hottest"]:
-        hottest_data.append({
-            "title": truncate(it["title"], 20),
-            "full_title": it["title"],
-            "weight": it["weight"],
-            "url": it.get("url", ""),
-            "platform": it.get("platform_name", ""),
+    # AI 卡片
+    ai_cards: List[Dict[str, Any]] = []
+    ai_found = False
+    ai_message = ""
+    for blk in ai_blocks:
+        title, content = blk.get("title", ""), blk.get("content", "")
+        if not title:
+            ai_message = content or "AI 分析暂不可用"
+            continue
+        ai_found = True
+        style = style_ai_block(title)
+        bullets = split_bullets(content)
+        if not bullets:
+            continue
+        ai_cards.append({
+            "key": style["key"],
+            "title": title,
+            "icon": style["icon"],
+            "color": style["color"],
+            "wide": style["wide"],
+            "bullets": bullets,
         })
 
-    # ── RSS 区域 ──
-    rss_sections = []
-    if rss_grouped:
-        for feed_name, items in rss_grouped.items():
-            cards = "".join(_render_rss_card(it) for it in items[:30])
-            rss_sections.append(f"""
-      <div class="rss-feed-group">
-        <h3 class="rss-feed-title">{html_escape(feed_name)} <span class="category-count">{len(items)}</span></h3>
-        <div class="news-list">{cards}</div>
-      </div>""")
-    rss_html = "\n".join(rss_sections)
+    # 图表数据
+    cat_items = list(news_data["categorized"].items())
+    pie = [{"name": c, "value": len(its)} for c, its in cat_items]
+    if len(pie) > 8:
+        top = pie[:8]
+        top.append({"name": "其他", "value": sum(d["value"] for d in pie[8:])})
+        pie = top
+    bar = [{"name": n, "value": v} for n, v in news_data["sorted_platforms"][:8]]
 
-    # ── AI 分析区域 ──
-    if ai_html:
-        ai_section = f"""
-    <section class="ai-dashboard-card">
-      <div class="ai-card-header">
-        <div class="ai-card-icon">
-          <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a4 4 0 0 1 4 4v1a4 4 0 0 1-8 0V6a4 4 0 0 1 4-4z"/><path d="M8 14s-4 2-4 6h16c0-4-4-6-4-6"/></svg>
-        </div>
-        <h2 class="ai-card-title">AI 智能分析</h2>
-      </div>
-      <div class="ai-card-body">{ai_html}</div>
-    </section>"""
-    else:
-        ai_section = """
-    <section class="ai-dashboard-card ai-placeholder">
-      <div class="ai-card-header">
-        <div class="ai-card-icon" style="opacity:0.5;">
-          <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a4 4 0 0 1 4 4v1a4 4 0 0 1-8 0V6a4 4 0 0 1 4-4z"/><path d="M8 14s-4 2-4 6h16c0-4-4-6-4-6"/></svg>
-        </div>
-        <h2 class="ai-card-title" style="opacity:0.6;">AI 智能分析</h2>
-      </div>
-      <div class="ai-card-body ai-empty-hint">AI 分析未生成</div>
-    </section>"""
+    # 销售视图
+    sales_views = build_sales_views(news_data)
 
-    # ── 完整热榜（按平台 Tab 切换） ──
-    platform_news: Dict[str, List[Dict[str, Any]]] = {}
-    for item in news_data["all_news"]:
-        pname = item["platform_name"]
-        platform_news.setdefault(pname, []).append(item)
+    # RSS 视图
+    rss_view = None
+    rss_total = sum(len(g["items"]) for g in rss_groups)
+    if rss_groups:
+        rss_view = {"id": "rss", "label": "行业资讯", "icon": "📰",
+                    "type": "rss", "groups": rss_groups, "count": rss_total}
 
-    # 按新闻数量排序平台
-    sorted_platform_names = sorted(
-        platform_news.keys(),
-        key=lambda p: len(platform_news[p]),
-        reverse=True,
-    )
+    # 总榜视图
+    hotlist = build_hotlist(news_data)
+    hotlist_view = None
+    if hotlist:
+        hotlist_view = {"id": "hotlist", "label": "总榜", "icon": "📋",
+                        "type": "hotlist", "platforms": hotlist,
+                        "count": news_data["total"]}
 
-    tab_buttons = []
-    tab_panels = []
-    for pidx, pname in enumerate(sorted_platform_names):
-        pitems = sorted(platform_news[pname], key=lambda x: x["rank"])
-        active = " active" if pidx == 0 else ""
-        tab_buttons.append(
-            f'<button class="tab-btn{active}" data-tab="tab-{pidx}">{html_escape(pname)} '
-            f'<span class="tab-count">{len(pitems)}</span></button>'
-        )
-        cards = "".join(_render_news_card(it) for it in pitems[:100])
-        tab_panels.append(
-            f'<div class="tab-panel{active}" id="tab-{pidx}"><div class="news-list">{cards}</div></div>'
-        )
+    # 导航顺序：销售视图（信号/科华/.../友商/其他分类）→ 行业资讯 → 总榜
+    nav_views = list(sales_views)
+    if rss_view:
+        nav_views.append(rss_view)
+    if hotlist_view:
+        nav_views.append(hotlist_view)
 
-    hotlist_html = f"""
-    <section id="sec-hotlist" class="hotlist-section">
-      <div class="section-title-row">
-        <h2 class="section-title">完整热榜</h2>
-        <button class="collapse-btn" onclick="toggleHotlist(this)" aria-label="折叠/展开">
-          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
-        </button>
-      </div>
-      <div class="hotlist-content">
-        <div class="tab-bar">{"".join(tab_buttons)}</div>
-        <div class="tab-panels">{"".join(tab_panels)}</div>
-      </div>
-    </section>"""
+    date_obj = now
+    try:
+        date_obj = datetime.strptime(target_date, "%Y-%m-%d")
+    except ValueError:
+        pass
 
-    # ── 图表数据 JSON ──
-    chart_data_json = json.dumps({
-        "pie": chart_pie_data,
-        "platforms": [{"name": n, "value": v} for n, v in platform_bar_data],
-        "hottest": hottest_data,
-        "categoryColors": CATEGORY_PALETTE,
-    }, ensure_ascii=False)
-
-    # ── 组装完整 HTML ──
-    return _HTML_TEMPLATE.replace("__ECHARTS_CDN__", ECHARTS_CDN) \
-        .replace("__TITLE__", "TrendRadar 情报仪表盘") \
-        .replace("__DATE__", date_str) \
-        .replace("__TIME__", time_str) \
-        .replace("__HISTORY_OPTIONS__", history_options) \
-        .replace("__REL_PREFIX__", rel_prefix) \
-        .replace("__SUMMARY_CARDS__", summary_cards) \
-        .replace("__PILLS__", pills_html) \
-        .replace("__AI_SECTION__", ai_section) \
-        .replace("__CATEGORIES__", categories_html) \
-        .replace("__RSS_SECTION__", rss_html) \
-        .replace("__HOTLIST__", hotlist_html) \
-        .replace("__CHART_DATA__", chart_data_json) \
-        .replace("__FOOTER_TIME__", now_display())
+    payload = {
+        "meta": {
+            "dateBig": f"{date_obj.year}年{date_obj.month}月{date_obj.day}日",
+            "weekday": WEEKDAYS_CN[date_obj.weekday()],
+            "badge": briefing_badge(now.hour),
+            "genTime": now_display(),
+            "dataDate": data_date or target_date,
+            "stale": bool(data_date and data_date != target_date),
+        },
+        "stats": {
+            "news": news_data["total"],
+            "rss": rss_total,
+            "hit": news_data["hit_count"],
+            "new": news_data["new_count"],
+        },
+        "ai": {
+            "found": ai_found,
+            "message": ai_message,
+            "cards": ai_cards,
+        },
+        "charts": {"pie": pie, "bar": bar, "palette": CATEGORY_PALETTE},
+        "views": nav_views,
+        "history": history,
+    }
+    return payload
 
 
 # ═══════════════════════════════════════════════════════════════
-#  HTML / CSS / JS 模板
+#  HTML 模板
 # ═══════════════════════════════════════════════════════════════
 
 _HTML_TEMPLATE = r"""<!DOCTYPE html>
@@ -1087,910 +1107,772 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>__TITLE__</title>
+<title>TrendRadar 销售情报简报</title>
 <script src="__ECHARTS_CDN__"></script>
 <style>
-/* ═══════════════════════════════════════════════════════════
-   CSS 变量与主题
-   ═══════════════════════════════════════════════════════════ */
+/* ───────────────────────────── 主题变量 ───────────────────────────── */
 :root {
-  --bg: #f5f7fa;
+  --sidebar-bg: #0a1628;
+  --sidebar-bg2: #0d1d36;
+  --sidebar-text: #b8c4d9;
+  --sidebar-text-dim: #6b7a94;
+  --sidebar-active: #2563eb;
+  --bg: #f1f4f9;
   --card-bg: #ffffff;
-  --text: #1a1a2e;
-  --text-secondary: #5a5a7a;
-  --text-muted: #9999b0;
-  --border: #e8eaf0;
-  --accent: #1677ff;
-  --accent-light: #e6f4ff;
-  --shadow: 0 2px 12px rgba(0,0,0,0.06);
-  --shadow-hover: 0 4px 20px rgba(0,0,0,0.1);
-  --radius: 12px;
-  --rank-bg: #f0f2f5;
-  --rank-text: #999;
-  --header-bg: linear-gradient(135deg, #1677ff 0%, #4096ff 100%);
-  --pill-bg: #f0f2f5;
-  --pill-active-bg: #1677ff;
-  --pill-active-text: #fff;
+  --text: #16233b;
+  --text-2: #55617a;
+  --text-3: #8b96ab;
+  --border: #e4e9f2;
+  --hover: #f4f7fc;
+  --accent: #2563eb;
+  --accent-soft: #e8f0fe;
+  --shadow: 0 1px 3px rgba(16,42,82,.06), 0 4px 16px rgba(16,42,82,.05);
+  --gold: #f5b53d; --silver: #a8b3c5; --bronze: #d08a3e;
+  --danger: #dc2626;
 }
 [data-theme="dark"] {
-  --bg: #0f0f1a;
-  --card-bg: #1a1a2e;
-  --text: #e8e8f0;
-  --text-secondary: #a0a0c0;
-  --text-muted: #6a6a8a;
-  --border: #2a2a3e;
-  --accent: #4096ff;
-  --accent-light: #111d3a;
-  --shadow: 0 2px 12px rgba(0,0,0,0.3);
-  --shadow-hover: 0 4px 20px rgba(0,0,0,0.4);
-  --rank-bg: #2a2a3e;
-  --rank-text: #888;
-  --header-bg: linear-gradient(135deg, #0f0f1a 0%, #1a1a3e 100%);
-  --pill-bg: #2a2a3e;
-  --pill-active-bg: #4096ff;
-  --pill-active-text: #fff;
+  --sidebar-bg: #060d1a;
+  --sidebar-bg2: #0a1628;
+  --bg: #0a1120;
+  --card-bg: #111d33;
+  --text: #e2e9f5;
+  --text-2: #9fadc6;
+  --text-3: #66758f;
+  --border: #1e2c46;
+  --hover: #16233d;
+  --accent: #4d8dff;
+  --accent-soft: #15233f;
+  --shadow: 0 1px 3px rgba(0,0,0,.4);
 }
-
-/* ═══════════════════════════════════════════════════════════
-   基础重置
-   ═══════════════════════════════════════════════════════════ */
-* { margin: 0; padding: 0; box-sizing: border-box; }
-html { scroll-behavior: smooth; scroll-padding-top: 80px; }
+* { margin:0; padding:0; box-sizing:border-box; }
+html { scroll-behavior:smooth; }
 body {
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
-               "Hiragino Sans GB", "Microsoft YaHei", "Helvetica Neue",
-               Helvetica, Arial, sans-serif;
-  background: var(--bg);
-  color: var(--text);
-  line-height: 1.6;
-  transition: background 0.3s, color 0.3s;
-  min-height: 100vh;
+               "Hiragino Sans GB", "Microsoft YaHei", "Helvetica Neue", Arial, sans-serif;
+  background: var(--bg); color: var(--text);
+  line-height: 1.55; transition: background .25s, color .25s;
 }
-a { color: var(--accent); text-decoration: none; }
-a:hover { text-decoration: underline; }
+a { text-decoration:none; color:inherit; }
+button { font-family:inherit; cursor:pointer; border:none; background:none; color:inherit; }
+::-webkit-scrollbar { width:8px; height:8px; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius:4px; }
 
-/* ═══════════════════════════════════════════════════════════
-   顶部导航栏
-   ═══════════════════════════════════════════════════════════ */
-.header {
-  position: sticky; top: 0; z-index: 100;
-  background: var(--header-bg);
-  color: #fff;
-  padding: 0 24px;
-  height: 64px;
-  display: flex; align-items: center; justify-content: space-between;
-  box-shadow: 0 2px 12px rgba(0,0,0,0.15);
-  backdrop-filter: blur(12px);
+/* ───────────────────────────── 侧边栏 ───────────────────────────── */
+.sidebar {
+  position:fixed; top:0; left:0; bottom:0; width:220px; z-index:50;
+  background: linear-gradient(180deg, var(--sidebar-bg) 0%, var(--sidebar-bg2) 100%);
+  color: var(--sidebar-text);
+  display:flex; flex-direction:column;
+  border-right:1px solid rgba(255,255,255,.05);
 }
-.header-left { display: flex; align-items: center; gap: 16px; }
-.header-logo {
-  width: 36px; height: 36px;
-  background: rgba(255,255,255,0.2);
-  border-radius: 10px;
-  display: flex; align-items: center; justify-content: center;
-  font-size: 20px; font-weight: 700;
+.sidebar-brand {
+  padding:18px 16px 14px; display:flex; align-items:center; gap:10px;
+  border-bottom:1px solid rgba(255,255,255,.06);
 }
-.header-title { font-size: 20px; font-weight: 700; letter-spacing: 0.5px; }
-.header-subtitle { font-size: 12px; opacity: 0.8; margin-top: 2px; }
-.header-right { display: flex; align-items: center; gap: 12px; }
-.history-select {
-  padding: 8px 12px;
-  border-radius: 8px;
-  border: 1px solid rgba(255,255,255,0.3);
-  background: rgba(255,255,255,0.15);
-  color: #fff;
-  font-size: 13px;
-  cursor: pointer;
-  outline: none;
-  backdrop-filter: blur(8px);
-  transition: background 0.2s;
+.brand-mark {
+  width:34px; height:34px; border-radius:9px; flex:none;
+  background: linear-gradient(135deg,#2563eb,#1e40af);
+  display:flex; align-items:center; justify-content:center;
+  font-weight:800; font-size:16px; color:#fff;
 }
-.history-select:hover { background: rgba(255,255,255,0.25); }
-.history-select option { color: #333; background: #fff; }
-.theme-toggle {
-  width: 40px; height: 40px;
-  border-radius: 10px;
-  border: 1px solid rgba(255,255,255,0.3);
-  background: rgba(255,255,255,0.15);
-  color: #fff;
-  cursor: pointer;
-  display: flex; align-items: center; justify-content: center;
-  transition: all 0.2s;
-  backdrop-filter: blur(8px);
+.brand-name { font-size:14px; font-weight:700; color:#fff; line-height:1.3; }
+.brand-sub { font-size:11px; color:var(--sidebar-text-dim); margin-top:1px; }
+.sidebar-nav { flex:1; overflow-y:auto; padding:10px 8px; }
+.nav-label {
+  font-size:10.5px; color:var(--sidebar-text-dim); letter-spacing:1px;
+  padding:10px 10px 4px; font-weight:600;
 }
-.theme-toggle:hover { background: rgba(255,255,255,0.25); transform: rotate(15deg); }
+.nav-item {
+  display:flex; align-items:center; gap:9px; width:100%;
+  padding:8px 10px; border-radius:8px; font-size:13.5px; color:var(--sidebar-text);
+  transition: background .15s, color .15s; white-space:nowrap; text-align:left;
+}
+.nav-item:hover { background:rgba(255,255,255,.07); color:#fff; }
+.nav-item.active { background:var(--sidebar-active); color:#fff; font-weight:600; }
+.nav-item .ico { width:20px; text-align:center; flex:none; font-size:14px; }
+.nav-item .txt { flex:1; overflow:hidden; text-overflow:ellipsis; }
+.nav-item .cnt {
+  font-size:11px; padding:1px 7px; border-radius:10px; flex:none;
+  background:rgba(255,255,255,.12); color:inherit; font-weight:600;
+}
+.nav-item.active .cnt { background:rgba(255,255,255,.25); }
+.nav-item.child { padding-left:34px; font-size:13px; }
+.nav-item.child .ico { font-size:11px; width:14px; }
+.sidebar-foot { padding:10px 12px 14px; border-top:1px solid rgba(255,255,255,.06); }
+.foot-select {
+  width:100%; padding:7px 8px; border-radius:8px; font-size:12px;
+  background:rgba(255,255,255,.08); color:var(--sidebar-text);
+  border:1px solid rgba(255,255,255,.1); outline:none; margin-bottom:8px;
+}
+.foot-select option { color:#1a2438; background:#fff; }
+.foot-row { display:flex; gap:8px; }
+.foot-btn {
+  flex:1; padding:7px 0; border-radius:8px; font-size:12px;
+  background:rgba(255,255,255,.08); color:var(--sidebar-text);
+  border:1px solid rgba(255,255,255,.1); display:flex; align-items:center;
+  justify-content:center; gap:5px; transition:background .15s;
+}
+.foot-btn:hover { background:rgba(255,255,255,.16); color:#fff; }
+.foot-time { font-size:10.5px; color:var(--sidebar-text-dim); margin-top:8px; text-align:center; }
 
-/* ═══════════════════════════════════════════════════════════
-   主内容区
-   ═══════════════════════════════════════════════════════════ */
-.main {
-  max-width: 1280px;
-  margin: 0 auto;
-  padding: 24px 16px 40px;
+/* ───────────────────────────── 移动端顶栏 ───────────────────────────── */
+.mobile-bar {
+  display:none; position:sticky; top:0; z-index:60;
+  background:var(--sidebar-bg); color:#fff;
+  padding:8px 10px; align-items:center; gap:8px;
+}
+.mobile-tabs { display:flex; gap:6px; overflow-x:auto; flex:1; scrollbar-width:none; }
+.mobile-tabs::-webkit-scrollbar { display:none; }
+.mtab {
+  flex:none; padding:6px 12px; border-radius:16px; font-size:12.5px;
+  background:rgba(255,255,255,.1); color:var(--sidebar-text); white-space:nowrap;
+}
+.mtab.active { background:var(--sidebar-active); color:#fff; font-weight:600; }
+.mtab .cnt { font-size:10.5px; opacity:.85; margin-left:3px; }
+.micon-btn {
+  flex:none; width:32px; height:32px; border-radius:8px; font-size:14px;
+  background:rgba(255,255,255,.1); color:#fff; display:flex; align-items:center; justify-content:center;
 }
 
-/* ═══════════════════════════════════════════════════════════
-   摘要卡片
-   ═══════════════════════════════════════════════════════════ */
-.summary-grid {
-  display: grid;
-  grid-template-columns: repeat(4, 1fr);
-  gap: 16px;
-  margin-bottom: 24px;
-}
-.summary-card {
-  background: var(--card-bg);
-  border-radius: var(--radius);
-  padding: 20px;
-  display: flex; align-items: center; gap: 16px;
-  box-shadow: var(--shadow);
-  transition: all 0.3s ease;
-  border: 1px solid var(--border);
-}
-.summary-card:hover {
-  transform: translateY(-3px);
-  box-shadow: var(--shadow-hover);
-}
-.summary-icon {
-  width: 48px; height: 48px;
-  border-radius: 12px;
-  display: flex; align-items: center; justify-content: center;
-  flex-shrink: 0;
-}
-.summary-value { font-size: 28px; font-weight: 700; line-height: 1.2; }
-.summary-label { font-size: 13px; color: var(--text-secondary); margin-top: 4px; }
+/* ───────────────────────────── 主内容 ───────────────────────────── */
+.content { margin-left:220px; padding:26px 30px 60px; max-width:1280px; }
+.view { display:none; animation:fade .25s ease; }
+.view.active { display:block; }
+@keyframes fade { from{opacity:0; transform:translateY(6px);} to{opacity:1; transform:none;} }
 
-/* ═══════════════════════════════════════════════════════════
-   图表区域
-   ═══════════════════════════════════════════════════════════ */
-.charts-grid {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 16px;
-  margin-bottom: 24px;
+/* 简报头 */
+.brief-head { margin-bottom:18px; }
+.brief-date { font-size:30px; font-weight:800; letter-spacing:.5px; display:flex; align-items:baseline; gap:14px; flex-wrap:wrap; }
+.brief-week { font-size:17px; font-weight:600; color:var(--text-2); }
+.brief-badge {
+  font-size:12.5px; font-weight:700; color:#fff; padding:4px 13px;
+  border-radius:14px; background:linear-gradient(135deg,#2563eb,#1d4ed8);
+  vertical-align:middle;
 }
-.chart-card {
-  background: var(--card-bg);
-  border-radius: var(--radius);
-  padding: 20px;
-  box-shadow: var(--shadow);
-  border: 1px solid var(--border);
-}
-.chart-card.full-width { grid-column: 1 / -1; }
-.chart-title {
-  font-size: 15px; font-weight: 600;
-  margin-bottom: 12px;
-  color: var(--text);
-}
-.chart-container { width: 100%; height: 320px; }
+.brief-stale { font-size:12.5px; color:#b45309; background:#fef3c7; border:1px solid #fde68a; padding:5px 12px; border-radius:8px; margin-top:10px; display:inline-block; }
+[data-theme="dark"] .brief-stale { color:#fbbf24; background:#3a2d12; border-color:#5a4718; }
 
-/* ═══════════════════════════════════════════════════════════
-   AI 分析卡片
-   ═══════════════════════════════════════════════════════════ */
-.ai-dashboard-card {
-  background: linear-gradient(135deg, #667eea15 0%, #764ba215 100%);
-  border: 1px solid #667eea30;
-  border-radius: var(--radius);
-  padding: 24px;
-  margin-bottom: 24px;
-  transition: all 0.3s;
+/* 统计卡 */
+.stat-grid { display:grid; grid-template-columns:repeat(4,1fr); gap:14px; margin:18px 0 22px; }
+.stat-card {
+  background:var(--card-bg); border:1px solid var(--border); border-radius:12px;
+  padding:14px 16px; display:flex; align-items:center; gap:12px; box-shadow:var(--shadow);
 }
-.ai-dashboard-card:hover { box-shadow: var(--shadow-hover); }
-.ai-card-header { display: flex; align-items: center; gap: 10px; margin-bottom: 16px; }
-.ai-card-icon {
-  width: 40px; height: 40px;
-  border-radius: 10px;
-  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-  color: #fff;
-  display: flex; align-items: center; justify-content: center;
-}
-.ai-card-title { font-size: 18px; font-weight: 700; }
-.ai-card-body { font-size: 14px; line-height: 1.8; }
-.ai-empty-hint { color: var(--text-muted); font-style: italic; padding: 8px 0; }
+.stat-ico { width:38px; height:38px; border-radius:10px; display:flex; align-items:center; justify-content:center; font-size:18px; flex:none; }
+.stat-val { font-size:22px; font-weight:800; line-height:1.1; }
+.stat-lab { font-size:12px; color:var(--text-3); margin-top:2px; }
 
-/* TrendRadar 原始 AI 区块样式兼容 */
-.ai-section {
-  background: var(--card-bg);
-  border-radius: var(--radius);
-  padding: 20px;
-  border: 1px solid var(--border);
+/* AI 卡片 */
+.ai-grid { display:grid; grid-template-columns:repeat(2,1fr); gap:14px; margin-bottom:22px; }
+.ai-card {
+  background:var(--card-bg); border:1px solid var(--border); border-left:4px solid var(--cc);
+  border-radius:12px; padding:15px 17px; box-shadow:var(--shadow); position:relative;
 }
-.ai-section-header { display: flex; align-items: center; gap: 10px; margin-bottom: 16px; }
-.ai-section-title { font-size: 16px; font-weight: 700; }
-.ai-section-badge {
-  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-  color: #fff;
-  font-size: 11px;
-  padding: 2px 8px;
-  border-radius: 10px;
-  font-weight: 600;
+.ai-card.wide { grid-column:span 2; background:linear-gradient(180deg, color-mix(in srgb, var(--cc) 7%, var(--card-bg)), var(--card-bg)); }
+.ai-card-head { display:flex; align-items:center; gap:9px; margin-bottom:10px; }
+.ai-card-ico {
+  width:30px; height:30px; border-radius:8px; flex:none; font-size:15px;
+  display:flex; align-items:center; justify-content:center;
+  background:color-mix(in srgb, var(--cc) 14%, transparent);
 }
-.ai-blocks-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-  gap: 16px;
+.ai-card-title { font-size:15px; font-weight:700; color:var(--cc); }
+.ai-card-tag { margin-left:auto; font-size:10.5px; font-weight:700; color:var(--cc);
+  background:color-mix(in srgb, var(--cc) 12%, transparent); padding:2px 8px; border-radius:10px; }
+.ai-bullets { list-style:none; }
+.ai-bullets li {
+  position:relative; padding:4px 0 4px 16px; font-size:13px; color:var(--text-2);
+  line-height:1.65;
 }
-.ai-block {
-  background: var(--bg);
-  border-radius: 10px;
-  padding: 16px;
-  border: 1px solid var(--border);
+.ai-bullets li::before {
+  content:""; position:absolute; left:2px; top:12px; width:6px; height:6px;
+  border-radius:50%; background:var(--cc);
 }
-.ai-block-title {
-  font-size: 14px; font-weight: 600;
-  margin-bottom: 8px;
-  color: var(--accent);
+.ai-bullets li.hidden-bullet { display:none; }
+.ai-expand {
+  margin-top:8px; font-size:12.5px; font-weight:600; color:var(--cc);
+  padding:4px 0; display:inline-flex; align-items:center; gap:4px;
 }
-.ai-block-content { font-size: 13px; color: var(--text-secondary); line-height: 1.8; }
-.ai-warning { color: #f5222d; padding: 12px; background: #fff1f0; border-radius: 8px; }
-.ai-info { color: var(--text-secondary); padding: 12px; }
-[data-theme="dark"] .ai-warning { background: #2a1215; color: #ff7875; }
+.ai-placeholder {
+  grid-column:span 2; background:var(--card-bg); border:1px dashed var(--border);
+  border-radius:12px; padding:34px; text-align:center; color:var(--text-3);
+}
+.ai-placeholder .ph-ico { font-size:34px; opacity:.5; margin-bottom:10px; }
+.ai-placeholder .ph-msg { font-size:13px; margin-top:6px; color:var(--text-3); }
 
-/* ═══════════════════════════════════════════════════════════
-   分类导航 Pills
-   ═══════════════════════════════════════════════════════════ */
-.pills-bar {
-  display: flex;
-  gap: 8px;
-  overflow-x: auto;
-  padding: 4px 0 16px;
-  margin-bottom: 8px;
-  scrollbar-width: thin;
-  -webkit-overflow-scrolling: touch;
-}
-.pills-bar::-webkit-scrollbar { height: 4px; }
-.pills-bar::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
-.pill {
-  flex-shrink: 0;
-  padding: 8px 16px;
-  border-radius: 20px;
-  border: 1px solid var(--border);
-  background: var(--card-bg);
-  color: var(--text-secondary);
-  font-size: 13px;
-  font-weight: 500;
-  cursor: pointer;
-  white-space: nowrap;
-  transition: all 0.25s ease;
-  display: inline-flex; align-items: center; gap: 6px;
-}
-.pill:hover { border-color: var(--accent); color: var(--accent); }
-.pill.active {
-  background: var(--accent);
-  color: #fff;
-  border-color: var(--accent);
-}
-.pill-count {
-  background: rgba(0,0,0,0.08);
-  padding: 1px 7px;
-  border-radius: 10px;
-  font-size: 11px;
-  font-weight: 600;
-}
-.pill.active .pill-count { background: rgba(255,255,255,0.25); }
+/* 图表 */
+.chart-grid { display:grid; grid-template-columns:1fr 1fr; gap:14px; margin-bottom:8px; }
+.chart-card { background:var(--card-bg); border:1px solid var(--border); border-radius:12px; padding:14px 16px; box-shadow:var(--shadow); }
+.chart-title { font-size:13.5px; font-weight:700; color:var(--text-2); margin-bottom:6px; }
+.chart-box { height:250px; width:100%; }
 
-/* ═══════════════════════════════════════════════════════════
-   分类区域与新闻卡片
-   ═══════════════════════════════════════════════════════════ */
-.category-section {
-  margin-bottom: 28px;
-  padding-left: 12px;
-  border-left: 3px solid var(--cat-color, var(--accent));
+/* 视图标题 */
+.view-head { display:flex; align-items:center; gap:10px; margin:4px 0 14px; }
+.view-title { font-size:21px; font-weight:800; }
+.view-count { font-size:12.5px; color:var(--accent); background:var(--accent-soft); padding:3px 11px; border-radius:12px; font-weight:700; }
+.view-sub { font-size:12.5px; color:var(--text-3); margin-left:auto; }
+
+/* 搜索框 */
+.list-toolbar {
+  position:sticky; top:10px; z-index:20; margin-bottom:12px;
+  display:flex; gap:8px; align-items:center;
 }
-.category-header {
-  display: flex; align-items: center; gap: 10px;
-  margin-bottom: 14px;
+.search-box {
+  flex:1; display:flex; align-items:center; gap:8px;
+  background:var(--card-bg); border:1px solid var(--border); border-radius:10px;
+  padding:8px 13px; box-shadow:var(--shadow);
 }
-.category-dot { width: 10px; height: 10px; border-radius: 50%; }
-.category-title { font-size: 18px; font-weight: 700; }
-.category-count {
-  background: var(--pill-bg);
-  color: var(--text-secondary);
-  font-size: 12px;
-  padding: 2px 10px;
-  border-radius: 10px;
-  font-weight: 600;
+.search-box input {
+  flex:1; border:none; outline:none; background:transparent;
+  font-size:13.5px; color:var(--text); font-family:inherit;
 }
-.news-list { display: flex; flex-direction: column; gap: 10px; }
-.news-card {
-  background: var(--card-bg);
-  border-radius: 10px;
-  padding: 14px 16px;
-  display: flex; gap: 14px;
-  box-shadow: var(--shadow);
-  border: 1px solid var(--border);
-  transition: all 0.25s ease;
+.search-box .s-ico { color:var(--text-3); font-size:14px; }
+.search-clear { font-size:12px; color:var(--text-3); padding:2px 6px; border-radius:6px; }
+.search-clear:hover { background:var(--hover); color:var(--text); }
+
+/* 新闻行（收件箱式） */
+.news-list { background:var(--card-bg); border:1px solid var(--border); border-radius:12px; overflow:hidden; box-shadow:var(--shadow); }
+.news-row {
+  display:flex; align-items:center; gap:12px; padding:9px 14px;
+  border-bottom:1px solid var(--border); transition:background .12s;
 }
-.news-card:hover {
-  transform: translateX(4px);
-  box-shadow: var(--shadow-hover);
-  border-color: var(--accent);
+.news-row:last-child { border-bottom:none; }
+.news-row:hover { background:var(--hover); }
+.rank-badge {
+  width:26px; height:26px; border-radius:50%; flex:none;
+  display:flex; align-items:center; justify-content:center;
+  font-size:12px; font-weight:700; background:var(--accent-soft); color:var(--text-3);
 }
-.news-rank {
-  width: 32px; height: 32px;
-  border-radius: 8px;
-  display: flex; align-items: center; justify-content: center;
-  font-size: 14px; font-weight: 600;
-  flex-shrink: 0;
+.rank-badge.r1 { background:linear-gradient(135deg,#f7c948,#f59e0b); color:#fff; }
+.rank-badge.r2 { background:linear-gradient(135deg,#c3ccd9,#94a3b8); color:#fff; }
+.rank-badge.r3 { background:linear-gradient(135deg,#e0a063,#c07a2e); color:#fff; }
+.rank-badge.dot { background:transparent; color:var(--accent); font-size:16px; }
+.row-main { flex:1; min-width:0; }
+.row-title {
+  display:block; font-size:14px; color:var(--text); font-weight:500;
+  white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
 }
-.news-body { flex: 1; min-width: 0; }
-.news-title-row {
-  display: flex; align-items: center; gap: 8px;
-  margin-bottom: 6px;
+a.row-title:hover { color:var(--accent); }
+.row-meta { display:flex; align-items:center; gap:8px; margin-top:2px; font-size:11.5px; color:var(--text-3); }
+.src-tag {
+  padding:1px 8px; border-radius:9px; font-size:11px; font-weight:600;
+  background:var(--accent-soft); color:var(--accent); flex:none;
 }
-.news-title {
-  font-size: 14px;
-  font-weight: 500;
-  color: var(--text);
-  line-height: 1.5;
-}
-a.news-title:hover { color: var(--accent); text-decoration: none; }
+.row-trend { cursor:help; }
+.row-summary { font-size:12px; color:var(--text-3); margin-top:2px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.row-side { flex:none; display:flex; align-items:center; gap:10px; font-size:11.5px; color:var(--text-3); }
 .badge-new {
-  background: #f5222d;
-  color: #fff;
-  font-size: 10px;
-  padding: 1px 6px;
-  border-radius: 4px;
-  font-weight: 700;
-  flex-shrink: 0;
-  animation: pulse 2s infinite;
+  background:#fee2e2; color:#dc2626; font-size:10px; font-weight:800;
+  padding:1px 6px; border-radius:6px; letter-spacing:.5px;
 }
-@keyframes pulse {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.6; }
+[data-theme="dark"] .badge-new { background:#3d1a1a; color:#f87171; }
+.row-crawl { white-space:nowrap; }
+
+/* RSS 分组 */
+.rss-group { margin-bottom:18px; }
+.rss-group-head {
+  display:flex; align-items:center; gap:9px; margin:6px 2px 8px;
+  font-size:14px; font-weight:700; color:var(--text-2);
 }
-.news-meta { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-.source-tag {
-  font-size: 11px;
-  padding: 2px 8px;
-  border-radius: 4px;
-  font-weight: 500;
+.rss-group-head .g-bar { width:4px; height:15px; border-radius:2px; background:var(--accent); }
+.rss-group-head .g-cnt { font-size:11.5px; color:var(--text-3); font-weight:500; }
+
+/* 总榜平台 tabs */
+.plat-tabs { display:flex; gap:6px; flex-wrap:wrap; margin-bottom:12px; }
+.plat-tab {
+  padding:6px 14px; border-radius:16px; font-size:13px; font-weight:600;
+  background:var(--card-bg); border:1px solid var(--border); color:var(--text-2);
+  transition:all .15s;
 }
-.meta-time, .meta-crawl {
-  font-size: 12px;
-  color: var(--text-muted);
+.plat-tab .cnt { font-size:11px; color:var(--text-3); margin-left:4px; }
+.plat-tab.active { background:var(--accent); border-color:var(--accent); color:#fff; }
+.plat-tab.active .cnt { color:rgba(255,255,255,.8); }
+
+.more-btn {
+  width:100%; padding:11px; font-size:13px; font-weight:600; color:var(--accent);
+  background:var(--card-bg); border:1px dashed var(--border); border-top:none;
+  border-radius:0 0 12px 12px;
 }
-.meta-crawl::before { content: "🔥 "; }
-.rss-summary {
-  font-size: 13px;
-  color: var(--text-secondary);
-  margin-bottom: 6px;
-  line-height: 1.5;
-}
-.more-hint {
-  text-align: center;
-  color: var(--text-muted);
-  font-size: 13px;
-  padding: 8px;
+.more-btn:hover { background:var(--hover); }
+.empty-hint {
+  padding:40px; text-align:center; color:var(--text-3); font-size:13.5px;
+  background:var(--card-bg); border:1px dashed var(--border); border-radius:12px;
 }
 
-/* ═══════════════════════════════════════════════════════════
-   RSS 区域
-   ═══════════════════════════════════════════════════════════ */
-.rss-section { margin-bottom: 28px; }
-.rss-feed-group { margin-bottom: 20px; }
-.rss-feed-title {
-  font-size: 15px; font-weight: 600;
-  margin-bottom: 10px;
-  display: flex; align-items: center; gap: 8px;
+/* 回到顶部 */
+.back-top {
+  position:fixed; right:26px; bottom:26px; width:42px; height:42px; border-radius:50%;
+  background:var(--accent); color:#fff; display:flex; align-items:center; justify-content:center;
+  box-shadow:0 4px 14px rgba(37,99,235,.4); opacity:0; pointer-events:none;
+  transition:opacity .2s, transform .2s; z-index:70;
 }
-.rss-card .news-rank { display: none; }
+.back-top.show { opacity:1; pointer-events:auto; }
+.back-top:hover { transform:translateY(-2px); }
 
-/* ═══════════════════════════════════════════════════════════
-   完整热榜（Tab 切换）
-   ═══════════════════════════════════════════════════════════ */
-.hotlist-section {
-  margin-bottom: 28px;
-  background: var(--card-bg);
-  border-radius: var(--radius);
-  padding: 20px;
-  box-shadow: var(--shadow);
-  border: 1px solid var(--border);
-}
-.section-title-row {
-  display: flex; align-items: center; justify-content: space-between;
-  margin-bottom: 16px;
-}
-.section-title { font-size: 18px; font-weight: 700; }
-.collapse-btn {
-  background: none; border: none;
-  color: var(--text-secondary);
-  cursor: pointer;
-  padding: 6px;
-  border-radius: 6px;
-  display: flex; align-items: center;
-  transition: all 0.2s;
-}
-.collapse-btn:hover { background: var(--pill-bg); }
-.collapse-btn.collapsed svg { transform: rotate(-90deg); }
-.collapse-btn svg { transition: transform 0.3s; }
-.hotlist-content.collapsed { display: none; }
-.tab-bar {
-  display: flex; gap: 6px;
-  overflow-x: auto;
-  padding-bottom: 8px;
-  margin-bottom: 16px;
-  border-bottom: 1px solid var(--border);
-  scrollbar-width: thin;
-}
-.tab-btn {
-  flex-shrink: 0;
-  padding: 8px 14px;
-  border: none;
-  background: none;
-  color: var(--text-secondary);
-  font-size: 13px;
-  font-weight: 500;
-  cursor: pointer;
-  border-radius: 8px 8px 0 0;
-  transition: all 0.2s;
-  white-space: nowrap;
-  display: inline-flex; align-items: center; gap: 6px;
-}
-.tab-btn:hover { color: var(--accent); background: var(--accent-light); }
-.tab-btn.active {
-  color: var(--accent);
-  border-bottom: 2px solid var(--accent);
-  font-weight: 600;
-}
-.tab-count {
-  background: var(--pill-bg);
-  font-size: 11px;
-  padding: 1px 7px;
-  border-radius: 10px;
-}
-.tab-btn.active .tab-count { background: var(--accent-light); color: var(--accent); }
-.tab-panel { display: none; }
-.tab-panel.active { display: block; }
-
-/* ═══════════════════════════════════════════════════════════
-   页脚
-   ═══════════════════════════════════════════════════════════ */
-.footer {
-  text-align: center;
-  padding: 24px 16px;
-  color: var(--text-muted);
-  font-size: 13px;
-  border-top: 1px solid var(--border);
-  margin-top: 20px;
-}
-
-/* ═══════════════════════════════════════════════════════════
-   回到顶部按钮
-   ═══════════════════════════════════════════════════════════ */
-.back-to-top {
-  position: fixed;
-  bottom: 32px; right: 32px;
-  width: 44px; height: 44px;
-  border-radius: 50%;
-  background: var(--accent);
-  color: #fff;
-  border: none;
-  cursor: pointer;
-  display: flex; align-items: center; justify-content: center;
-  box-shadow: 0 4px 16px rgba(22,119,255,0.4);
-  opacity: 0;
-  visibility: hidden;
-  transform: translateY(10px);
-  transition: all 0.3s ease;
-  z-index: 99;
-}
-.back-to-top.visible {
-  opacity: 1; visibility: visible; transform: translateY(0);
-}
-.back-to-top:hover { transform: translateY(-3px); box-shadow: 0 6px 20px rgba(22,119,255,0.5); }
-
-/* ═══════════════════════════════════════════════════════════
-   响应式布局
-   ═══════════════════════════════════════════════════════════ */
-@media (max-width: 1024px) {
-  .summary-grid { grid-template-columns: repeat(2, 1fr); }
-  .charts-grid { grid-template-columns: 1fr; }
-}
-@media (max-width: 640px) {
-  .header { padding: 0 12px; height: 56px; }
-  .header-title { font-size: 16px; }
-  .header-subtitle { display: none; }
-  .header-logo { width: 32px; height: 32px; font-size: 16px; }
-  .main { padding: 16px 10px 32px; }
-  .summary-grid { grid-template-columns: repeat(2, 1fr); gap: 10px; }
-  .summary-card { padding: 14px; gap: 10px; }
-  .summary-icon { width: 40px; height: 40px; }
-  .summary-value { font-size: 22px; }
-  .summary-label { font-size: 12px; }
-  .chart-container { height: 260px; }
-  .news-card { padding: 10px 12px; gap: 10px; }
-  .news-rank { width: 28px; height: 28px; font-size: 12px; }
-  .news-title { font-size: 13px; }
-  .category-title { font-size: 16px; }
-  .section-title { font-size: 16px; }
-  .ai-blocks-grid { grid-template-columns: 1fr; }
-  .back-to-top { bottom: 20px; right: 20px; width: 40px; height: 40px; }
-  .history-select { max-width: 120px; font-size: 12px; }
+/* ───────────────────────────── 响应式 ───────────────────────────── */
+@media (max-width: 920px) {
+  .sidebar { display:none; }
+  .mobile-bar { display:flex; }
+  .content { margin-left:0; padding:16px 14px 50px; }
+  .brief-date { font-size:23px; }
+  .stat-grid { grid-template-columns:repeat(2,1fr); gap:10px; }
+  .ai-grid { grid-template-columns:1fr; }
+  .ai-card.wide { grid-column:span 1; }
+  .ai-placeholder { grid-column:span 1; }
+  .chart-grid { grid-template-columns:1fr; }
+  .row-side { gap:7px; }
+  .row-crawl { display:none; }
+  .view-sub { display:none; }
 }
 </style>
 </head>
 <body>
 
-<!-- ═══════════ 顶部导航栏 ═══════════ -->
-<header class="header">
-  <div class="header-left">
-    <div class="header-logo">T</div>
+<!-- 侧边栏（桌面） -->
+<aside class="sidebar">
+  <div class="sidebar-brand">
+    <div class="brand-mark">TR</div>
     <div>
-      <div class="header-title">__TITLE__</div>
-      <div class="header-subtitle">__DATE__ __TIME__</div>
+      <div class="brand-name">销售情报简报</div>
+      <div class="brand-sub">TrendRadar · 科华UPS</div>
     </div>
   </div>
-  <div class="header-right">
-    <select class="history-select" onchange="navigateHistory(this)" aria-label="历史报告">
-      __HISTORY_OPTIONS__
+  <nav class="sidebar-nav" id="sidebarNav"></nav>
+  <div class="sidebar-foot">
+    <select class="foot-select" id="historySelect" aria-label="历史报告">
+      <option value="">📁 历史报告</option>
     </select>
-    <button class="theme-toggle" onclick="toggleTheme()" aria-label="切换明暗主题" title="切换明暗主题">
-      <svg id="theme-icon-sun" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:none;"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
-      <svg id="theme-icon-moon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
-    </button>
+    <div class="foot-row">
+      <button class="foot-btn" id="themeBtnSide" onclick="App.toggleTheme()">🌓 明暗</button>
+      <button class="foot-btn" onclick="App.goHome()">🏠 最新</button>
+    </div>
+    <div class="foot-time" id="footTime"></div>
   </div>
-</header>
+</aside>
 
-<!-- ═══════════ 主内容 ═══════════ -->
-<main class="main" id="sec-overview">
+<!-- 移动端顶栏 -->
+<div class="mobile-bar">
+  <div class="brand-mark" style="width:30px;height:30px;font-size:13px;">TR</div>
+  <div class="mobile-tabs" id="mobileTabs"></div>
+  <button class="micon-btn" onclick="App.toggleTheme()" aria-label="明暗主题">🌓</button>
+</div>
 
-  <!-- 摘要卡片 -->
-  __SUMMARY_CARDS__
+<!-- 主内容 -->
+<main class="content" id="content"></main>
 
-  <!-- 图表区域 -->
-  <div class="charts-grid">
-    <div class="chart-card">
-      <div class="chart-title">分类分布</div>
-      <div class="chart-container" id="chart-pie"></div>
-    </div>
-    <div class="chart-card">
-      <div class="chart-title">平台分布 Top 10</div>
-      <div class="chart-container" id="chart-platform"></div>
-    </div>
-    <div class="chart-card full-width">
-      <div class="chart-title">热度排行 Top 10</div>
-      <div class="chart-container" id="chart-hot" style="height:380px;"></div>
-    </div>
-  </div>
-
-  <!-- AI 分析 -->
-  __AI_SECTION__
-
-  <!-- 分类导航 -->
-  <nav class="pills-bar" id="pills-bar">
-    __PILLS__
-  </nav>
-
-  <!-- 分类新闻 -->
-  __CATEGORIES__
-
-  <!-- RSS 资讯 -->
-  <section id="sec-rss" class="rss-section">
-    <div class="category-header">
-      <div class="category-dot" style="background:#52c41a;"></div>
-      <h2 class="category-title">RSS 资讯</h2>
-    </div>
-    __RSS_SECTION__
-  </section>
-
-  <!-- 完整热榜 -->
-  __HOTLIST__
-
-</main>
-
-<!-- ═══════════ 页脚 ═══════════ -->
-<footer class="footer">
-  由 TrendRadar 自动生成 · __FOOTER_TIME__
-</footer>
-
-<!-- ═══════════ 回到顶部 ═══════════ -->
-<button class="back-to-top" id="backToTop" onclick="scrollToTop()" aria-label="回到顶部">
-  <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="18 15 12 9 6 15"/></svg>
+<button class="back-top" id="backTop" onclick="window.scrollTo({top:0,behavior:'smooth'})" aria-label="回到顶部">
+  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="18 15 12 9 6 15"/></svg>
 </button>
 
-<!-- ═══════════ 图表数据 ═══════════ -->
+<script>window.DASH_DATA = __DATA__;</script>
 <script>
-window.DASHBOARD_DATA = __CHART_DATA__;
-</script>
-
-<!-- ═══════════ 交互脚本 ═══════════ -->
-<script>
-(function() {
+(function(){
   'use strict';
+  var D = window.DASH_DATA || {};
+  var state = { view:'briefing', charts:{}, inited:false };
 
-  var data = window.DASHBOARD_DATA || {};
-  var charts = {};
-
-  // ── 主题管理 ──
-  function getTheme() {
-    return localStorage.getItem('tr-theme') || 'light';
+  function esc(s){
+    return String(s==null?'':s).replace(/[&<>"']/g, function(c){
+      return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
+    });
   }
-  function setTheme(theme) {
-    document.documentElement.setAttribute('data-theme', theme);
-    localStorage.setItem('tr-theme', theme);
-    updateThemeIcon(theme);
-    // 重新渲染图表以应用主题色
-    setTimeout(renderCharts, 50);
+
+  /* ─────────────── 主题 ─────────────── */
+  function getTheme(){ return localStorage.getItem('tr-theme') || 'light'; }
+  function setTheme(t){
+    document.documentElement.setAttribute('data-theme', t);
+    localStorage.setItem('tr-theme', t);
+    setTimeout(renderCharts, 60);
   }
-  function updateThemeIcon(theme) {
-    document.getElementById('theme-icon-sun').style.display = theme === 'dark' ? 'block' : 'none';
-    document.getElementById('theme-icon-moon').style.display = theme === 'dark' ? 'none' : 'block';
+  function toggleTheme(){ setTheme(getTheme()==='dark' ? 'light' : 'dark'); }
+
+  /* ─────────────── 历史报告 ─────────────── */
+  function reportHref(file){
+    var p = location.pathname.replace(/\\/g,'/');
+    if (/\/reports\//.test(p)) return file;       // 归档页：同目录
+    return 'reports/' + file;                     // 主页：reports/ 子目录
   }
-  window.toggleTheme = function() {
-    var current = getTheme();
-    setTheme(current === 'dark' ? 'light' : 'dark');
-  };
+  function fillHistory(){
+    var sel = document.getElementById('historySelect');
+    (D.history||[]).forEach(function(h){
+      var o = document.createElement('option');
+      o.value = reportHref(h.file); o.textContent = h.label;
+      sel.appendChild(o);
+    });
+    sel.onchange = function(){ if(sel.value) location.href = sel.value; };
+  }
+  function goHome(){
+    var p = location.pathname.replace(/\\/g,'/');
+    location.href = /\/reports\//.test(p) ? '../index.html' : (location.pathname + location.search);
+  }
 
-  // ── 历史报告导航 ──
-  window.navigateHistory = function(sel) {
-    if (sel.value) {
-      window.location.href = sel.value;
-    }
-  };
-
-  // ── 回到顶部 ──
-  window.scrollToTop = function() {
-    window.scrollTo({ top: 0, behavior: 'smooth' });
-  };
-  window.addEventListener('scroll', function() {
-    var btn = document.getElementById('backToTop');
-    if (window.pageYOffset > 400) {
-      btn.classList.add('visible');
-    } else {
-      btn.classList.remove('visible');
-    }
-  });
-
-  // ── 折叠完整热榜 ──
-  window.toggleHotlist = function(btn) {
-    var content = btn.closest('.hotlist-section').querySelector('.hotlist-content');
-    btn.classList.toggle('collapsed');
-    content.classList.toggle('collapsed');
-  };
-
-  // ── Pill 导航 ──
-  document.querySelectorAll('.pill').forEach(function(pill) {
-    pill.addEventListener('click', function() {
-      var target = document.getElementById(pill.dataset.target);
-      if (target) {
-        target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  /* ─────────────── 导航 ─────────────── */
+  function navEntries(){
+    var list = [{id:'briefing', label:'今日简报', icon:'📊', count:null}];
+    (D.views||[]).forEach(function(v){
+      list.push({id:v.id, label:v.label, icon:v.icon, count:viewCount(v), child:false});
+      if(v.type==='group'){
+        (v.children||[]).forEach(function(c){
+          list.push({id:c.id, label:c.label, icon:'·', count:viewCount(c), child:true, parent:v.id});
+        });
       }
     });
-  });
-
-  // 滚动时高亮当前 pill
-  var sections = [];
-  document.querySelectorAll('.pill').forEach(function(pill) {
-    var el = document.getElementById(pill.dataset.target);
-    if (el) sections.push({ el: el, pill: pill });
-  });
-  window.addEventListener('scroll', function() {
-    var scrollPos = window.pageYOffset + 120;
-    var current = sections[0];
-    sections.forEach(function(s) {
-      if (s.el.offsetTop <= scrollPos) current = s;
-    });
-    if (current) {
-      document.querySelectorAll('.pill').forEach(function(p) { p.classList.remove('active'); });
-      current.pill.classList.add('active');
+    return list;
+  }
+  function viewCount(v){
+    if(v.type==='rss') return (v.count!=null?v.count:(v.groups||[]).length);
+    if(v.type==='group') return v.count||0;
+    if(v.type==='hotlist') return v.count||0;
+    return (v.items||[]).length;
+  }
+  function findView(id){
+    if(id==='briefing') return null;
+    var views = D.views||[];
+    for(var i=0;i<views.length;i++){
+      if(views[i].id===id) return views[i];
+      if(views[i].type==='group'){
+        var ch = views[i].children||[];
+        for(var j=0;j<ch.length;j++) if(ch[j].id===id) return ch[j];
+      }
     }
-  });
+    return null;
+  }
 
-  // ── Tab 切换 ──
-  document.querySelectorAll('.tab-btn').forEach(function(btn) {
-    btn.addEventListener('click', function() {
-      var tabId = btn.dataset.tab;
-      btn.closest('.hotlist-section').querySelectorAll('.tab-btn').forEach(function(b) {
-        b.classList.remove('active');
+  function buildNav(){
+    var sb = document.getElementById('sidebarNav');
+    var mb = document.getElementById('mobileTabs');
+    var entries = navEntries();
+    var sbHtml = '', mbHtml = '';
+    entries.forEach(function(e){
+      var cnt = e.count==null ? '' : '<span class="cnt">'+e.count+'</span>';
+      sbHtml += '<button class="nav-item'+(e.child?' child':'')+'" data-view="'+e.id+'">'
+        + '<span class="ico">'+e.icon+'</span><span class="txt">'+esc(e.label)+'</span>'+cnt+'</button>';
+      mbHtml += '<button class="mtab" data-view="'+e.id+'">'+e.icon+' '+esc(e.label)
+        + (e.count==null?'':'<span class="cnt">'+e.count+'</span>')+'</button>';
+    });
+    sb.innerHTML = sbHtml; mb.innerHTML = mbHtml;
+    var all = document.querySelectorAll('[data-view]');
+    all.forEach(function(btn){
+      btn.addEventListener('click', function(){ switchView(btn.getAttribute('data-view')); });
+    });
+  }
+
+  function markActive(id){
+    document.querySelectorAll('.nav-item,.mtab').forEach(function(b){
+      b.classList.toggle('active', b.getAttribute('data-view')===id);
+    });
+  }
+
+  function switchView(id){
+    state.view = id;
+    markActive(id);
+    var content = document.getElementById('content');
+    content.innerHTML = '';
+    window.scrollTo({top:0});
+    if(id==='briefing'){
+      content.appendChild(renderBriefing());
+      setTimeout(renderCharts, 80);
+    } else {
+      var v = findView(id);
+      content.appendChild(renderListView(v));
+    }
+  }
+
+  /* ─────────────── 简报视图 ─────────────── */
+  function statCard(ico, color, val, label){
+    return '<div class="stat-card"><div class="stat-ico" style="background:'+color+'18;color:'+color+';">'
+      + ico+'</div><div><div class="stat-val">'+val+'</div><div class="stat-lab">'+label+'</div></div></div>';
+  }
+
+  function aiCardHTML(card){
+    var dots = (card.bullets||[]).map(function(b,i){
+      return '<li class="'+(i>=5?'hidden-bullet':'')+'">'+esc(b)+'</li>';
+    }).join('');
+    var expand = (card.bullets||[]).length>5
+      ? '<button class="ai-expand" onclick="App.toggleBullets(this)">展开更多 ▾</button>' : '';
+    return '<div class="ai-card'+(card.wide?' wide':'')+'" style="--cc:'+card.color+';">'
+      + '<div class="ai-card-head"><div class="ai-card-ico">'+card.icon+'</div>'
+      + '<div class="ai-card-title">'+esc(card.title)+'</div>'
+      + (card.wide?'<span class="ai-card-tag">重点</span>':'') + '</div>'
+      + '<ul class="ai-bullets">'+dots+'</ul>'+expand+'</div>';
+  }
+
+  function renderBriefing(){
+    var m = D.meta||{}, s = D.stats||{}, ai = D.ai||{};
+    var el = document.createElement('div');
+    el.className = 'view active';
+    var html = '';
+
+    html += '<div class="brief-head"><div class="brief-date">'
+      + '<span>'+esc(m.dateBig)+'</span><span class="brief-week">'+esc(m.weekday)+'</span>'
+      + '<span class="brief-badge">'+esc(m.badge)+'</span></div>';
+    if(m.stale){
+      html += '<div class="brief-stale">⚠ 今日数据库尚未生成，当前展示 '+esc(m.dataDate)+' 的数据</div>';
+    }
+    html += '</div>';
+
+    html += '<div class="stat-grid">'
+      + statCard('📈','#2563eb',s.news||0,'热榜新闻')
+      + statCard('📰','#0d9488',s.rss||0,'RSS资讯')
+      + statCard('🎯','#9333ea',s.hit||0,'分类命中')
+      + statCard('⚡','#f97316',s.new||0,'新增热点')
+      + '</div>';
+
+    if(ai.found && (ai.cards||[]).length){
+      html += '<div class="ai-grid">' + ai.cards.map(aiCardHTML).join('') + '</div>';
+    } else {
+      html += '<div class="ai-grid"><div class="ai-placeholder"><div class="ph-ico">🤖</div>'
+        + '<div style="font-size:15px;font-weight:700;color:var(--text-2);">AI 简报暂未生成</div>'
+        + '<div class="ph-msg">'+esc(ai.message||'运行 TrendRadar AI 分析后，此处将展示核心热点、舆论风向、弱信号、RSS 洞察与策略建议五个板块')+'</div></div></div>';
+    }
+
+    html += '<div class="chart-grid">'
+      + '<div class="chart-card"><div class="chart-title">分类分布</div><div class="chart-box" id="chartPie"></div></div>'
+      + '<div class="chart-card"><div class="chart-title">平台新闻数 Top 8</div><div class="chart-box" id="chartBar"></div></div>'
+      + '</div>';
+
+    el.innerHTML = html;
+    return el;
+  }
+
+  function toggleBullets(btn){
+    var card = btn.closest('.ai-card');
+    var hidden = card.querySelectorAll('.hidden-bullet');
+    var expanded = btn.getAttribute('data-open')==='1';
+    hidden.forEach(function(li){ li.style.display = expanded ? 'none' : 'list-item'; });
+    btn.setAttribute('data-open', expanded?'0':'1');
+    btn.textContent = expanded ? '展开更多 ▾' : '收起 ▴';
+  }
+
+  /* ─────────────── 列表视图 ─────────────── */
+  function rankBadge(r, isRss){
+    if(isRss) return '<div class="rank-badge dot">●</div>';
+    var cls = r===1?'r1':r===2?'r2':r===3?'r3':'';
+    return '<div class="rank-badge '+cls+'">'+(r>0&&r<999?r:'–')+'</div>';
+  }
+
+  function newsRowHTML(it, isRss){
+    var title = isRss
+      ? it.t
+      : it.t;
+    var link = it.u ? '<a class="row-title" href="'+esc(it.u)+'" target="_blank" rel="noopener noreferrer">'+esc(title)+'</a>'
+                    : '<span class="row-title">'+esc(title)+'</span>';
+    var meta, side='';
+    if(isRss){
+      meta = '<span class="src-tag">'+esc(it.f||'')+'</span>'
+        + (it.pub?'<span>'+esc(it.pub)+'</span>':'');
+      if(it.s_summary || it.summary){}
+    } else {
+      meta = '<span class="src-tag">'+esc(it.p||'')+'</span>'
+        + (it.tt?'<span class="row-trend" title="'+esc(it.tt)+'">轨迹 '+(it.tr||'')+'</span>':'');
+      side = (it.n?'<span class="badge-new">NEW</span>':'')
+        + '<span class="row-time">'+esc(it.l||'')+'</span>'
+        + '<span class="row-crawl">在榜'+esc(it.c||1)+'次</span>';
+    }
+    var summary = (isRss && it.summary) ? '<div class="row-summary">'+esc(it.summary)+'</div>' : '';
+    return '<div class="news-row" data-q="'+esc((it.t||'').toLowerCase())+'">'
+      + rankBadge(it.r, isRss)
+      + '<div class="row-main">'+link+'<div class="row-meta">'+meta+'</div>'+summary+'</div>'
+      + '<div class="row-side">'+side+'</div></div>';
+  }
+
+  function listWrap(inner, count){
+    return '<div class="list-toolbar"><div class="search-box">'
+      + '<span class="s-ico">🔍</span><input type="text" placeholder="筛选本列表标题…" class="list-search">'
+      + '<button class="search-clear" style="display:none;">清空</button></div></div>'
+      + inner;
+  }
+
+  function bindSearch(scope){
+    var input = scope.querySelector('.list-search');
+    if(!input) return;
+    var clear = scope.querySelector('.search-clear');
+    function apply(){
+      var q = input.value.trim().toLowerCase();
+      clear.style.display = q ? 'block' : 'none';
+      var rows = scope.querySelectorAll('.news-row');
+      var vis = 0;
+      rows.forEach(function(r){
+        var hit = !q || r.getAttribute('data-q').indexOf(q)>=0;
+        r.style.display = hit ? '' : 'none';
+        if(hit) vis++;
       });
-      btn.closest('.hotlist-section').querySelectorAll('.tab-panel').forEach(function(p) {
-        p.classList.remove('active');
+      var eh = scope.querySelector('.empty-hint.search-empty');
+      if(!q && eh) eh.remove();
+      if(q && !vis && !eh){
+        var d = document.createElement('div');
+        d.className='empty-hint search-empty'; d.textContent='没有匹配「'+input.value+'」的条目';
+        scope.querySelector('.news-list,.rss-groups,.plat-panel').appendChild(d);
+      } else if(q && vis && eh){ eh.remove(); }
+    }
+    input.addEventListener('input', apply);
+    clear.addEventListener('click', function(){ input.value=''; apply(); input.focus(); });
+  }
+
+  function bindMore(scope){
+    scope.querySelectorAll('.more-btn').forEach(function(btn){
+      btn.addEventListener('click', function(){
+        var list = btn.previousElementSibling;
+        list.querySelectorAll('.news-row.overflow').forEach(function(r){ r.classList.remove('overflow'); r.style.display=''; });
+        btn.remove();
       });
-      btn.classList.add('active');
-      document.getElementById(tabId).classList.add('active');
-      // 窗口变化时重绘图表
-      setTimeout(function() { Object.values(charts).forEach(function(c) { if (c) c.resize(); }); }, 100);
-    });
-  });
-
-  // ── ECharts 渲染 ──
-  function isDark() {
-    return document.documentElement.getAttribute('data-theme') === 'dark';
-  }
-  function chartTextColor() {
-    return isDark() ? '#a0a0c0' : '#666';
-  }
-  function chartAxisLineColor() {
-    return isDark() ? '#2a2a3e' : '#e8eaf0';
-  }
-  function chartSplitLineColor() {
-    return isDark() ? '#1e1e30' : '#f0f2f5';
-  }
-  function chartTooltipBg() {
-    return isDark() ? '#1a1a2e' : '#fff';
-  }
-
-  function renderPieChart() {
-    var el = document.getElementById('chart-pie');
-    if (!el || typeof echarts === 'undefined') return;
-    if (!charts.pie) charts.pie = echarts.init(el);
-    var colors = (data.categoryColors || []).slice(0, 8);
-    charts.pie.setOption({
-      tooltip: {
-        trigger: 'item',
-        backgroundColor: chartTooltipBg(),
-        borderColor: chartAxisLineColor(),
-        textStyle: { color: chartTextColor() }
-      },
-      legend: {
-        bottom: 0,
-        textStyle: { color: chartTextColor(), fontSize: 11 },
-        type: 'scroll'
-      },
-      color: colors.concat(['#999']),
-      series: [{
-        type: 'pie',
-        radius: ['42%', '70%'],
-        center: ['50%', '42%'],
-        avoidLabelOverlap: true,
-        itemStyle: { borderRadius: 6, borderColor: isDark() ? '#1a1a2e' : '#fff', borderWidth: 2 },
-        label: { show: false },
-        emphasis: {
-          label: { show: true, fontSize: 14, fontWeight: 'bold', color: chartTextColor() }
-        },
-        data: data.pie || []
-      }]
     });
   }
 
-  function renderPlatformChart() {
-    var el = document.getElementById('chart-platform');
-    if (!el || typeof echarts === 'undefined') return;
-    if (!charts.platform) charts.platform = echarts.init(el);
-    var pData = data.platforms || [];
-    var names = pData.map(function(d) { return d.name; }).reverse();
-    var values = pData.map(function(d) { return d.value; }).reverse();
-    charts.platform.setOption({
-      tooltip: {
-        trigger: 'axis',
-        axisPointer: { type: 'shadow' },
-        backgroundColor: chartTooltipBg(),
-        borderColor: chartAxisLineColor(),
-        textStyle: { color: chartTextColor() }
-      },
-      grid: { left: 100, right: 24, top: 10, bottom: 20 },
-      xAxis: {
-        type: 'value',
-        axisLine: { lineStyle: { color: chartAxisLineColor() } },
-        axisLabel: { color: chartTextColor(), fontSize: 11 },
-        splitLine: { lineStyle: { color: chartSplitLineColor() } }
-      },
-      yAxis: {
-        type: 'category',
-        data: names,
-        axisLine: { lineStyle: { color: chartAxisLineColor() } },
-        axisLabel: { color: chartTextColor(), fontSize: 11 }
-      },
-      series: [{
-        type: 'bar',
-        data: values,
-        barWidth: '60%',
-        itemStyle: {
-          borderRadius: [0, 4, 4, 0],
-          color: new echarts.graphic.LinearGradient(0, 0, 1, 0, [
-            { offset: 0, color: '#1677ff' },
-            { offset: 1, color: '#69b1ff' }
-          ])
-        },
-        label: {
-          show: true,
-          position: 'right',
-          color: chartTextColor(),
-          fontSize: 11
-        }
-      }]
-    });
+  function capRows(htmlList){
+    // 超过 50 条：其后行加 overflow（CSS 由 JS 控制 display）
   }
 
-  function renderHotChart() {
-    var el = document.getElementById('chart-hot');
-    if (!el || typeof echarts === 'undefined') return;
-    if (!charts.hot) charts.hot = echarts.init(el);
-    var hData = (data.hottest || []).slice().reverse();
-    var names = hData.map(function(d) { return d.title; });
-    var values = hData.map(function(d) { return d.weight; });
-    var urls = hData.map(function(d) { return d.url; });
-    charts.hot.setOption({
-      tooltip: {
-        trigger: 'axis',
-        axisPointer: { type: 'shadow' },
-        backgroundColor: chartTooltipBg(),
-        borderColor: chartAxisLineColor(),
-        textStyle: { color: chartTextColor() },
-        formatter: function(params) {
-          var p = params[0];
-          var idx = p.dataIndex;
-          var item = hData[idx];
-          var html = '<b>' + (item.full_title || item.name) + '</b><br/>';
-          html += '平台: ' + (item.platform || '') + '<br/>';
-          html += '热度: ' + p.value;
+  function renderNewsList(items, isRss){
+    if(!items || !items.length){
+      return '<div class="empty-hint">暂无相关条目</div>';
+    }
+    var rows = items.map(function(it, i){
+      var html = newsRowHTML(it, isRss);
+      if(i>=50){
+        html = html.replace('<div class="news-row"', '<div class="news-row overflow" style="display:none;"');
+      }
+      return html;
+    }).join('');
+    var more = items.length>50 ? '<button class="more-btn">显示更多（还有 '+(items.length-50)+' 条）▾</button>' : '';
+    return '<div class="news-list">'+rows+'</div>'+more;
+  }
+
+  function renderListView(v){
+    var el = document.createElement('div');
+    el.className = 'view active';
+    if(!v){ el.innerHTML = '<div class="empty-hint">视图不存在</div>'; return el; }
+
+    var head = '<div class="view-head"><span style="font-size:22px;">'+v.icon+'</span>'
+      + '<div class="view-title">'+esc(v.label)+'</div>'
+      + '<span class="view-count">'+viewCount(v)+'</span></div>';
+
+    var body = '';
+    if(v.type==='rss'){
+      body = (v.groups||[]).map(function(g){
+        var rows = g.items.map(function(it,i){
+          var html = newsRowHTML(it, true);
+          if(i>=50) html = html.replace('<div class="news-row"', '<div class="news-row overflow" style="display:none;"');
           return html;
+        }).join('');
+        var more = g.items.length>50 ? '<button class="more-btn">显示更多（还有 '+(g.items.length-50)+' 条）▾</button>' : '';
+        return '<div class="rss-group"><div class="rss-group-head"><span class="g-bar"></span>'
+          + esc(g.name)+'<span class="g-cnt">'+g.items.length+' 条</span></div>'
+          + '<div class="news-list">'+rows+'</div>'+more+'</div>';
+      }).join('');
+      el.innerHTML = head + listWrap('<div class="rss-groups">'+body+'</div>');
+    } else if(v.type==='hotlist'){
+      var tabs = (v.platforms||[]).map(function(p,i){
+        return '<button class="plat-tab'+(i===0?' active':'')+'" data-pi="'+i+'">'+esc(p.n)
+          +'<span class="cnt">'+p.items.length+'</span></button>';
+      }).join('');
+      var panels = (v.platforms||[]).map(function(p,i){
+        var rows = p.items.map(function(it,j){
+          var html = newsRowHTML(it, false);
+          if(j>=100) html = html.replace('<div class="news-row"', '<div class="news-row overflow" style="display:none;"');
+          return html;
+        }).join('');
+        var more = p.items.length>100 ? '<button class="more-btn">显示更多（还有 '+(p.items.length-100)+' 条）▾</button>' : '';
+        return '<div class="plat-panel" data-pi="'+i+'" style="'+(i===0?'':'display:none;')+'">'
+          + '<div class="news-list">'+rows+'</div>'+more+'</div>';
+      }).join('');
+      el.innerHTML = head + listWrap('<div class="plat-tabs">'+tabs+'</div><div class="plat-panels">'+panels+'</div>');
+      el.querySelectorAll('.plat-tab').forEach(function(t){
+        t.addEventListener('click', function(){
+          el.querySelectorAll('.plat-tab').forEach(function(x){x.classList.remove('active');});
+          t.classList.add('active');
+          var pi = t.getAttribute('data-pi');
+          el.querySelectorAll('.plat-panel').forEach(function(p){
+            p.style.display = p.getAttribute('data-pi')===pi ? '' : 'none';
+          });
+        });
+      });
+    } else {
+      // 商机信号视图顶部嵌入策略建议卡
+      var strategyTop = '';
+      if(v.id==='signals' && D.ai && D.ai.found){
+        var strat = (D.ai.cards||[]).filter(function(c){return c.key==='strategy';})[0];
+        if(strat){
+          strategyTop = '<div style="margin-bottom:14px;">'+aiCardHTML(strat)+'</div>';
         }
-      },
-      grid: { left: 10, right: 40, top: 10, bottom: 20, containLabel: true },
-      xAxis: {
-        type: 'value',
-        axisLine: { lineStyle: { color: chartAxisLineColor() } },
-        axisLabel: { color: chartTextColor(), fontSize: 11 },
-        splitLine: { lineStyle: { color: chartSplitLineColor() } }
-      },
-      yAxis: {
-        type: 'category',
-        data: names,
-        axisLine: { lineStyle: { color: chartAxisLineColor() } },
-        axisLabel: {
-          color: chartTextColor(),
-          fontSize: 12,
-          width: 160,
-          overflow: 'truncate'
-        }
-      },
-      series: [{
-        type: 'bar',
-        data: values.map(function(v, i) {
-          return {
-            value: v,
-            itemStyle: {
-              borderRadius: [0, 4, 4, 0],
-              color: new echarts.graphic.LinearGradient(0, 0, 1, 0, [
-                { offset: 0, color: i >= values.length - 3 ? '#fa8c16' : '#722ed1' },
-                { offset: 1, color: i >= values.length - 3 ? '#ffc069' : '#b37feb' }
-              ])
-            }
-          };
-        }),
-        barWidth: '55%',
-        label: {
-          show: true,
-          position: 'right',
-          color: chartTextColor(),
-          fontSize: 11,
-          formatter: '{c}'
-        }
-      }]
-    });
-    // 点击跳转
-    charts.hot.off('click');
-    charts.hot.on('click', function(params) {
-      var url = urls[params.dataIndex];
-      if (url) window.open(url, '_blank');
-    });
+      }
+      body = renderNewsList(v.items||[], false);
+      el.innerHTML = head + strategyTop + listWrap(body);
+    }
+
+    bindSearch(el);
+    bindMore(el);
+    return el;
   }
 
-  function renderCharts() {
-    renderPieChart();
-    renderPlatformChart();
-    renderHotChart();
+  /* ─────────────── 图表 ─────────────── */
+  function isDark(){ return document.documentElement.getAttribute('data-theme')==='dark'; }
+  function cText(){ return isDark() ? '#9fadc6' : '#55617a'; }
+  function cLine(){ return isDark() ? '#1e2c46' : '#e4e9f2'; }
+  function cSplit(){ return isDark() ? '#16233d' : '#eef2f8'; }
+  function cTipBg(){ return isDark() ? '#111d33' : '#fff'; }
+
+  function renderCharts(){
+    if(typeof echarts==='undefined') return;
+    if(state.view!=='briefing') return;
+    var pieEl = document.getElementById('chartPie');
+    var barEl = document.getElementById('chartBar');
+    var palette = (D.charts&&D.charts.palette) || [];
+
+    if(pieEl){
+      if(!state.charts.pie) state.charts.pie = echarts.init(pieEl);
+      state.charts.pie.setOption({
+        tooltip:{trigger:'item', backgroundColor:cTipBg(), borderColor:cLine(),
+          textStyle:{color:cText(), fontSize:12}},
+        legend:{bottom:0, type:'scroll', textStyle:{color:cText(), fontSize:11}, itemWidth:10, itemHeight:10},
+        color: palette.concat(['#8b96ab']),
+        series:[{type:'pie', radius:['45%','70%'], center:['50%','42%'],
+          itemStyle:{borderRadius:5, borderColor:isDark()?'#111d33':'#fff', borderWidth:2},
+          label:{show:false},
+          emphasis:{label:{show:true, fontSize:13, fontWeight:'bold', color:cText()}},
+          data:(D.charts&&D.charts.pie)||[]}]
+      }, true);
+    }
+    if(barEl){
+      if(!state.charts.bar) state.charts.bar = echarts.init(barEl);
+      var d = ((D.charts&&D.charts.bar)||[]).slice().reverse();
+      state.charts.bar.setOption({
+        tooltip:{trigger:'axis', axisPointer:{type:'shadow'}, backgroundColor:cTipBg(),
+          borderColor:cLine(), textStyle:{color:cText(), fontSize:12}},
+        grid:{left:8, right:30, top:8, bottom:8, containLabel:true},
+        xAxis:{type:'value', axisLine:{lineStyle:{color:cLine()}},
+          axisLabel:{color:cText(), fontSize:11}, splitLine:{lineStyle:{color:cSplit()}}},
+        yAxis:{type:'category', data:d.map(function(x){return x.name;}),
+          axisLine:{lineStyle:{color:cLine()}}, axisTick:{show:false},
+          axisLabel:{color:cText(), fontSize:11.5, width:92, overflow:'truncate'}},
+        series:[{type:'bar', data:d.map(function(x){return x.value;}), barWidth:'58%',
+          itemStyle:{borderRadius:[0,4,4,0],
+            color:new echarts.graphic.LinearGradient(0,0,1,0,[
+              {offset:0,color:'#1d4ed8'},{offset:1,color:'#60a5fa'}])},
+          label:{show:true, position:'right', color:cText(), fontSize:11}}]
+      }, true);
+    }
+    Object.keys(state.charts).forEach(function(k){ state.charts[k].resize(); });
   }
 
-  // 窗口大小变化时重绘
-  var resizeTimer;
-  window.addEventListener('resize', function() {
-    clearTimeout(resizeTimer);
-    resizeTimer = setTimeout(function() {
-      Object.values(charts).forEach(function(c) { if (c) c.resize(); });
-    }, 200);
+  window.addEventListener('resize', function(){
+    Object.keys(state.charts).forEach(function(k){ if(state.charts[k]) state.charts[k].resize(); });
+  });
+  window.addEventListener('scroll', function(){
+    document.getElementById('backTop').classList.toggle('show', window.pageYOffset>400);
   });
 
-  // ── 初始化 ──
-  setTheme(getTheme());
-  if (typeof echarts !== 'undefined') {
-    renderCharts();
-  } else {
-    // ECharts 加载失败时显示提示
-    console.warn('ECharts 未能加载，图表区域将不可用');
+  /* ─────────────── 初始化 ─────────────── */
+  function init(){
+    document.getElementById('footTime').textContent = '生成于 ' + ((D.meta||{}).genTime||'');
+    setTheme(getTheme());
+    fillHistory();
+    buildNav();
+    switchView('briefing');
+    state.inited = true;
   }
+
+  window.App = { toggleTheme:toggleTheme, toggleBullets:toggleBullets, goHome:goHome };
+  init();
 })();
 </script>
 </body>
@@ -1998,114 +1880,109 @@ window.DASHBOARD_DATA = __CHART_DATA__;
 """
 
 
+def build_html(payload: Dict[str, Any]) -> str:
+    """将数据载荷注入 HTML 模板。"""
+    data_json = json.dumps(payload, ensure_ascii=False)
+    # 防止 </script> 注入破坏页面
+    data_json = data_json.replace("</", "<\\/")
+    return _HTML_TEMPLATE.replace("__ECHARTS_CDN__", ECHARTS_CDN) \
+                         .replace("__DATA__", data_json)
+
+
 # ═══════════════════════════════════════════════════════════════
-#  主函数
+#  主流程
 # ═══════════════════════════════════════════════════════════════
 
 def main() -> int:
-    """脚本入口。"""
     print("=" * 60)
-    print("  TrendRadar 情报仪表盘生成器")
+    print("  TrendRadar 销售情报仪表盘（早间简报版）")
     print("=" * 60)
 
-    # 确定根目录（脚本所在目录，兼容从任意位置运行）
     root_dir = Path(__file__).resolve().parent
-    # 如果脚本所在目录没有 config，尝试当前工作目录
     if not (root_dir / "config").exists():
         root_dir = Path.cwd()
     print(f"  工作目录: {root_dir}")
 
-    date_str = today_str()
-    time_str = now_display()
-    print(f"  报告日期: {date_str}（Asia/Shanghai）")
+    # 可选：--date YYYY-MM-DD 重新生成指定日期
+    target_date = today_str()
+    if len(sys.argv) >= 3 and sys.argv[1] == "--date":
+        target_date = sys.argv[2]
+    print(f"  目标日期: {target_date}（Asia/Shanghai）")
 
-    # ── 1. 读取频率词配置 ──
+    # 1) 频率词
     print("\n[1/6] 解析频率词配置...")
-    freq_path = root_dir / "config" / "frequency_words.txt"
-    groups, global_filters = parse_frequency_words(freq_path)
+    groups, global_filters = parse_frequency_words(
+        root_dir / "config" / "frequency_words.txt")
     print(f"  共加载 {len(groups)} 个词组，{len(global_filters)} 个全局过滤词")
 
-    # ── 2. 读取新闻数据库 ──
+    # 2) 新闻库（缺失时回退到最近一天）
     print("\n[2/6] 读取热榜新闻数据库...")
-    news_db_path = root_dir / "output" / "news" / f"{date_str}.db"
-    news_items, platform_map, latest_crawl = load_news_db(news_db_path)
+    news_db = root_dir / "output" / "news" / f"{target_date}.db"
+    data_date: Optional[str] = None
+    if not news_db.exists():
+        latest = find_latest_db(root_dir / "output" / "news", "")
+        if latest:
+            news_db = latest
+            data_date = latest.stem
+            print(f"  [提示] 当日库不存在，回退到最近数据库: {latest.name}")
+    news_items, platform_map, latest_crawl = load_news_db(news_db)
 
-    # ── 3. 读取 RSS 数据库 ──
+    # 3) RSS 库（与新闻同日；否则取最近）
     print("\n[3/6] 读取 RSS 数据库...")
-    rss_db_path = root_dir / "output" / "rss" / f"{date_str}.db"
-    rss_items, feed_map = load_rss_db(rss_db_path)
+    rss_db = root_dir / "output" / "rss" / f"{(data_date or target_date)}.db"
+    if not rss_db.exists():
+        latest_rss = find_latest_db(root_dir / "output" / "rss", "")
+        if latest_rss:
+            rss_db = latest_rss
+            print(f"  [提示] 回退到最近 RSS 数据库: {latest_rss.name}")
+    rss_items, feed_map = load_rss_db(rss_db)
 
-    # ── 4. 提取 AI 分析 ──
+    # 4) AI 分析
     print("\n[4/6] 提取 AI 分析内容...")
-    index_html_path = root_dir / "index.html"
-    ai_html = extract_ai_analysis(index_html_path)
+    ai_blocks = extract_ai_blocks(root_dir / "index.html")
 
-    # ── 5. 数据处理 ──
+    # 5) 数据处理
     print("\n[5/6] 处理数据与分类...")
-    news_data = process_news(
-        news_items, platform_map, groups, global_filters, latest_crawl
-    )
-    rss_grouped = process_rss(rss_items, feed_map)
+    news_data = process_news(news_items, platform_map, groups,
+                             global_filters, latest_crawl)
+    rss_groups = process_rss(rss_items, feed_map)
     print(f"  新闻总数: {news_data['total']}")
     print(f"  分类命中: {news_data['hit_count']}")
     print(f"  新增热点: {news_data['new_count']}")
-    print(f"  RSS 资讯: {sum(len(v) for v in rss_grouped.values())}")
+    print(f"  RSS 资讯: {sum(len(g['items']) for g in rss_groups)}")
 
-    # ── 6. 生成 HTML ──
+    # 6) 生成 HTML
     print("\n[6/6] 生成 HTML 仪表盘...")
+    site_dir = root_dir / SITE_DIR
+    reports_site = root_dir / REPORTS_SITE_DIR
+    reports_git = root_dir / REPORTS_GIT_DIR
+    for d in (site_dir, reports_site, reports_git):
+        d.mkdir(parents=True, exist_ok=True)
 
-    # 确保输出目录存在
-    site_path = root_dir / SITE_DIR
-    reports_path = root_dir / REPORTS_DIR
-    site_path.mkdir(parents=True, exist_ok=True)
-    reports_path.mkdir(parents=True, exist_ok=True)
+    history = scan_history_reports()
+    print(f"  发现 {len(history)} 份历史报告（_site/reports + reports 合并）")
 
-    # 扫描历史报告（在写入新报告之前）
-    history_reports = scan_history_reports()
-    print(f"  发现 {len(history_reports)} 份历史报告")
+    payload = build_payload(news_data, rss_groups, ai_blocks, history,
+                            target_date, data_date)
+    html = build_html(payload)
 
-    # 生成主页 HTML
-    html_main = build_html(
-        news_data=news_data,
-        rss_grouped=rss_grouped,
-        ai_html=ai_html,
-        history_reports=history_reports,
-        date_str=date_str,
-        time_str=time_str,
-        rel_prefix="",
-    )
+    index_out = site_dir / "index.html"
+    index_out.write_text(html, encoding="utf-8")
+    print(f"  已写入: {index_out.relative_to(root_dir)}")
 
-    # 写入 _site/index.html
-    index_output = site_path / "index.html"
-    with open(index_output, "w", encoding="utf-8") as f:
-        f.write(html_main)
-    print(f"  已写入: {index_output}")
+    report_name = f"{timestamp_label()}.html"
+    site_report = reports_site / report_name
+    git_report = reports_git / report_name
+    site_report.write_text(html, encoding="utf-8")
+    git_report.write_text(html, encoding="utf-8")
+    print(f"  已归档: {site_report.relative_to(root_dir)}")
+    print(f"  已备份: {git_report.relative_to(root_dir)}（git 持久化）")
 
-    # 写入归档副本 _site/reports/YYYY-MM-DD-HHMM.html
-    report_filename = f"{timestamp_label()}.html"
-    report_output = reports_path / report_filename
-
-    # 归档页面使用相对路径前缀 "../"
-    html_report = build_html(
-        news_data=news_data,
-        rss_grouped=rss_grouped,
-        ai_html=ai_html,
-        history_reports=history_reports,
-        date_str=date_str,
-        time_str=time_str,
-        rel_prefix="../",
-    )
-    with open(report_output, "w", encoding="utf-8") as f:
-        f.write(html_report)
-    print(f"  已归档: {report_output}")
-
-    # 清理旧报告
     cleanup_old_reports()
 
     print("\n" + "=" * 60)
     print("  仪表盘生成完成！")
-    print(f"  主页: {index_output}")
-    print(f"  归档: {report_output}")
+    print(f"  主页: {index_out}")
     print("=" * 60)
     return 0
 
